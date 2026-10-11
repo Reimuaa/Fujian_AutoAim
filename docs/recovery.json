@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "date": "2026-10-11",
+  "platform": "ubuntu-22.04-x86_64",
+  "config_sha256": "a87f67b3ee5a28a68e01e576550ce05ce792e73c5943c25b5c4382c6d3ab2b6f",
+  "binary_sha256": "ece053d6f494d72e0a0d923aec38af1767eea5099a1da3f16e59d191965cff90",
+  "note": "User-reported high accuracy; actual hit counts and flashed firmware unknown.",
+  "runtime": {
+    "name": "runtime.tar.gz",
+    "size": 496846676,
+    "sha256": "910adaced77760249051e30a9a9a9613410428b52ec51958ce61a136cfd6d9be",
+    "file_count": 27440,
+    "uncompressed_bytes": 1338163779
+  },
+  "logs": {
+    "name": "field-logs.tar.gz",
+    "size": 97620309,
+    "sha256": "a87c8b7878da306cd33e90c6bdaf7747d0f0c1596851d7c46df1f6aec9a8be79",
+    "file_count": 53,
+    "uncompressed_bytes": 474208083
+  },
+  "release_tag": "field-2026.10.11",
+  "release_url": "https://github.com/Reimuaa/Fujian_AutoAim/releases/tag/field-2026.10.11",
+  "release_download_base": "https://github.com/Reimuaa/Fujian_AutoAim/releases/download/field-2026.10.11"
+}

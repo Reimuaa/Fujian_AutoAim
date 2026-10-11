@@ -137,7 +137,7 @@ if(ament_cmake_FOUND AND rclcpp_FOUND AND std_msgs_FOUND AND visualization_msgs_
     message(STATUS "[auto_aim] ROS2 support enabled for tracker marker visualization")
     target_compile_definitions(auto_aim PRIVATE AMENT_CMAKE_FOUND)
     target_link_libraries(auto_aim PUBLIC rclcpp::rclcpp)
-    ament_target_dependencies(auto_aim rclcpp std_msgs visualization_msgs)
+    ament_target_dependencies(auto_aim PUBLIC rclcpp std_msgs visualization_msgs)
 else()
     message(STATUS "[auto_aim] ROS2 not available, tracker marker visualization disabled")
 endif()

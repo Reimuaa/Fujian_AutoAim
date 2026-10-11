@@ -2,6 +2,12 @@
 
 正式运行配置为configs/standard.yaml，标定工具配置为configs/calibration.yaml。启动器生成的logs/xuc-bringup/field_autoaim.runtime.yaml是缓存；不要将它作为另一份配置源。颜色选择保存在~/.config/sp-vision/field_autoaim_enemy_color。
 
+## 2026-10-11晚间步兵发布参数
+
+当前步兵以`configs/standard.yaml`的实际数值为准：Aimer高/低速延迟均为0.325s、旋转预测水平门限0.5°、配置弹速20m/s、弹道P轴微调-0.50°。ROI开启，区域x=420、y=300、600×600；YOLO26角点细化开启。`debug`、`detector_debug`和`infantry_diagnostics_enabled`均关闭，云台控制及开火权限开启。独立高速事件延迟`xuc_event_fire_delay_s`仍为0.085s，高/低电平保持450/550ms，额外重装填间隔0ms。
+
+P轴微调通过减少向上的弹道补偿生效，并受补偿下限0°约束；不是所有距离恒定降低8cm。旧注释中的3.2m/8cm对应之前-1.40°的试验背景。配置中的`pitch_offset: 6`是另一条原有参数，未在本轮更改。完整依赖与恢复方法见[快速恢复](recovery.md)。以下哨兵标定记录属于另一硬件目标，不能覆盖当前步兵参数。
+
 ## 内参：已完成
 
 2026-09-17，海康MV-CS016-10UC、1440×1080。DFvision Q12-200-15，12×9方格、11×8内角点；格长15 mm由用户确认。29张图像全部识别，k3固定为0。平均逐点重投影距离0.0894 px，RMS 0.10465 px。

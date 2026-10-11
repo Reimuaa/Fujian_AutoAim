@@ -71,7 +71,7 @@ use_traditional: true
 # YOLO26 previously ignored use_traditional.  The adaptive two-light-bar
 # refiner now uses it as the default enable and safely keeps network corners
 # whenever no geometrically consistent image candidate is found.
-yolo26_refine_corners: false
+yolo26_refine_corners: true
 corner_refine_roi_length_scale: 1.8
 corner_refine_roi_width_scale: 0.9
 corner_refine_max_center_error_ratio: 0.65
@@ -149,8 +149,8 @@ leaving_angle: 20
 decision_speed: 0.8
 # Base prediction: 85 ms delay plus projectile flight time.
 # Keep both Aimer speed branches equal; event timing is configured separately.
-high_speed_delay_time: 0.085
-low_speed_delay_time: 0.085
+high_speed_delay_time: 0.325
+low_speed_delay_time: 0.325
 
 actuation_delay_ms: 0
 
@@ -300,7 +300,7 @@ xuc_direct_pitch_filter_tau_ms: 60.0     # retain post-shot noise damping withou
 xuc_direct_pitch_hold_ms: 180.0          # 已保存双轴验收值：短丢帧保持
 xuc_direct_pitch_max_rate_dps: 45.0      # midpoint between the stable-but-slow 25 and previously validated 80 deg/s
 xuc_direct_pitch_error_gain: 1.35        # 弹道偏高单变量复测：与2.0对照，其余参数保持不变
-xuc_projectile_speed_mps: 28.0           # 弹道模型试验值，尚未测速；仅用静止靶对照
+xuc_projectile_speed_mps: 20.0           # 弹道模型试验值，尚未测速；仅用静止靶对照
 xuc_ballistic_reference_projectile_speed_mps: 10.0  # 0.91m/17cm实弹基准采集于2500rpm，禁止随当前转速重算
 xuc_ballistic_pitch_enabled: true   # XUC直接俯仰弹道补偿开启；对照28m/s试验值
 xuc_camera_forward_of_muzzle_m: 0.06     # 实测：相机中心在炮口前方 6 cm
@@ -308,7 +308,7 @@ xuc_camera_above_muzzle_m: 0.04          # 实测：相机中心在炮口上方 
 xuc_ballistic_reference_camera_range_m: 0.91
 xuc_ballistic_reference_total_drop_m: 0.08639  # physical 10m/s reference; zero fixed boresight bias
 xuc_ballistic_max_compensation_deg: 20.0    # 低弹速远距离补偿上限；下位机另保留25°/28°双层保护
-xuc_ballistic_pitch_trim_deg: 0.00     # 固定弹着微调为零；启用弹道模型时使用
+xuc_ballistic_pitch_trim_deg: -0.50    # 固定向下微调；约3.2m处补偿弹着偏高8cm，待实弹复核
 # Robust shared range for ballistic elevation and gyro time-of-flight.  The
 # rigid-body near-face range is authoritative; raw PnP depth contributes only a
 # bounded 5% correction so oblique plates cannot move the aim by metres.
