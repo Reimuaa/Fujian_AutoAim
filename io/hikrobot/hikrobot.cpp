@@ -1,5 +1,7 @@
 #include "hikrobot.hpp"
 
+#include <algorithm>
+#include <cmath>
 #include <libusb-1.0/libusb.h>
 #include <yaml-cpp/yaml.h>
 
@@ -13,6 +15,8 @@ HikRobot::HikRobot(const std::string & config_path)
 : exposure_us_(0.0),
   gain_(0.0),
   frame_rate_(150.0),
+  frame_time_offset_ms_(0.0),
+  frame_time_diagnostics_enabled_(false),
   width_(0),
   height_(0),
   white_balance_auto_(MV_BALANCEWHITE_AUTO_OFF),
@@ -34,6 +38,16 @@ HikRobot::HikRobot(const std::string & config_path)
   gain_ = yaml["gain"].as<double>();
   const auto vid_pid = yaml["vid_pid"].as<std::string>();
   if (yaml["camera_fps"]) frame_rate_ = yaml["camera_fps"].as<double>();
+  if (yaml["hikrobot_capture_to_exposure_ms"]) {
+    const double configured_offset_ms =
+      yaml["hikrobot_capture_to_exposure_ms"].as<double>();
+    if (std::isfinite(configured_offset_ms)) {
+      frame_time_offset_ms_ = std::clamp(configured_offset_ms, 0.0, 60.0);
+    }
+  }
+  if (yaml["infantry_diagnostics_enabled"]) {
+    frame_time_diagnostics_enabled_ = yaml["infantry_diagnostics_enabled"].as<bool>();
+  }
   if (yaml["camera_width"]) width_ = yaml["camera_width"].as<int64_t>();
   if (yaml["camera_height"]) height_ = yaml["camera_height"].as<int64_t>();
   if (yaml["hikrobot_pixel_format"]) {
@@ -188,14 +202,37 @@ void HikRobot::capture_start()
         break;
       }
 
-      auto timestamp = std::chrono::steady_clock::now();
+      const auto buffer_received_at = std::chrono::steady_clock::now();
+      // GetImageBuffer returns after exposure and transport.  Keep its host
+      // steady-clock time as the reference until the device/SDK timestamp epoch
+      // and tick unit are verified on this camera.  The offset is field-calibrated.
+      const auto timestamp = buffer_received_at -
+        std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+          std::chrono::duration<double, std::milli>(frame_time_offset_ms_));
       static bool logged_frame_format = false;
       if (!logged_frame_format) {
         tools::logger()->info(
-          "[HikRobot] first frame: {}x{}, pixel_type={:#x}, frame_len={}",
+          "[HikRobot] first frame: {}x{}, pixel_type={:#x}, frame_len={}, "
+          "capture_to_exposure_ms={:.2f}",
           raw.stFrameInfo.nWidth, raw.stFrameInfo.nHeight,
-          static_cast<unsigned int>(raw.stFrameInfo.enPixelType), raw.stFrameInfo.nFrameLen);
+          static_cast<unsigned int>(raw.stFrameInfo.enPixelType), raw.stFrameInfo.nFrameLen,
+          frame_time_offset_ms_);
         logged_frame_format = true;
+      }
+      static uint64_t frame_metadata_count = 0;
+      if (frame_time_diagnostics_enabled_ &&
+          (++frame_metadata_count <= 5 || frame_metadata_count % 300 == 0)) {
+        const uint64_t device_ticks =
+          (static_cast<uint64_t>(raw.stFrameInfo.nDevTimeStampHigh) << 32U) |
+          raw.stFrameInfo.nDevTimeStampLow;
+        const auto receive_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+          buffer_received_at.time_since_epoch()).count();
+        tools::logger()->info(
+          "[HikRobot][FRAME_TIME] frame={} device_ticks={} sdk_host_time={} "
+          "receive_steady_ns={} exposure_us={:.1f}",
+          raw.stFrameInfo.nFrameNum, device_ticks,
+          raw.stFrameInfo.nHostTimeStamp, receive_ns,
+          raw.stFrameInfo.fExposureTime);
       }
       cv::Mat rgb_img(cv::Size(raw.stFrameInfo.nWidth, raw.stFrameInfo.nHeight), CV_8UC3);
 

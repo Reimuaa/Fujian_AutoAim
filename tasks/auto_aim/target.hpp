@@ -28,6 +28,14 @@ public:
     double huber_threshold = 2.5;
   };
 
+  struct CenterProcessConfig
+  {
+    double acceleration_variance = 100.0;
+    bool gyro_adaptive_enabled = false;
+    double gyro_rate_threshold_rad_s = 0.8;
+    double gyro_acceleration_variance = 10.0;
+  };
+
   ArmorName name;
   ArmorType armor_type;
   ArmorPriority priority;
@@ -42,7 +50,8 @@ public:
   Target(
     const Armor & armor, std::chrono::steady_clock::time_point t, double radius, int armor_num,
     Eigen::VectorXd P0_dig, const YawESKF::Config & yaw_eskf_config,
-    const IteratedUpdateConfig & iterated_update_config);
+    const IteratedUpdateConfig & iterated_update_config,
+    const CenterProcessConfig & center_process_config);
   Target(double x, double vyaw, double radius, double h);
 
   void predict(std::chrono::steady_clock::time_point t);
@@ -61,10 +70,14 @@ public:
   double yaw_eskf_nis() const;
   int yaw_eskf_accepted_updates() const;
   int yaw_eskf_rejected_updates() const;
+  double center_acceleration_variance() const;
   bool armor_motion_trusted(int id) const;
   Eigen::Vector3d armor_motion_velocity(int id) const;
   double armor_motion_nis(int id) const;
   std::vector<Eigen::Vector4d> armor_xyza_list(bool prefer_direct_motion = false) const;
+  // Coherent rigid-body geometry from the whole-vehicle EKF only. Association
+  // and existing motion consumers continue to use armor_xyza_list()/ekf_x().
+  std::vector<Eigen::Vector4d> whole_ekf_armor_xyza_list() const;
   int armor_num() const;
 
   bool diverged() const;
@@ -86,12 +99,16 @@ private:
   YawESKF yaw_eskf_;
   std::array<ArmorMotionFilter, 4> armor_motion_filters_;
   IteratedUpdateConfig iterated_update_config_;
+  CenterProcessConfig center_process_config_;
+  double center_acceleration_variance_ = 100.0;
   std::chrono::steady_clock::time_point t_;
 
   void update_ypda(const Armor & armor, int id);  // yaw pitch distance angle
   void update_yaw_eskf(const Armor & armor, int id);
 
   Eigen::Vector3d h_armor_xyz(const Eigen::VectorXd & x, int id) const;
+  std::vector<Eigen::Vector4d> armor_xyza_from_state(
+    const Eigen::VectorXd & state, bool prefer_direct_motion) const;
   Eigen::MatrixXd h_jacobian(const Eigen::VectorXd & x, int id) const;
 };
 

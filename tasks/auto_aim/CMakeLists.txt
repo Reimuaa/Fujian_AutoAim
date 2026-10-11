@@ -12,9 +12,17 @@ set(AUTO_AIM_SOURCES
     voter.cpp
     shooter.cpp
     yolo.cpp
-    multithread/commandgener.cpp
-    planner/planner.cpp
 )
+
+# Linux 专属源文件：commandgener 调用 io::CBoard（硬件 CAN）并引入
+# plotter.hpp -> netinet/in.h POSIX 头链；planner/tinympc 依赖 dirent.h。
+# Windows gestalt 仿真不使用（与 bridge 版 Windows 构建一致）。
+if(NOT WIN32)
+    list(APPEND AUTO_AIM_SOURCES
+        multithread/commandgener.cpp
+        planner/planner.cpp
+    )
+endif()
 
 # 根据可用后端添加YOLO实现源文件
 set(YOLO_SOURCES "")
@@ -23,12 +31,15 @@ if(OpenVINO_FOUND)
     message(STATUS "[auto_aim] Adding OpenVINO YOLO implementations")
     list(APPEND YOLO_SOURCES
         classifier.cpp
-        multithread/mt_detector.cpp
         yolos/yolov5.cpp
         yolos/yolov8.cpp
         yolos/yolo11.cpp
         yolos/yolo26.cpp
     )
+    if(NOT WIN32)
+        # mt_detector 依赖 io::CBoard，仅 Linux/真机路径编译
+        list(APPEND YOLO_SOURCES multithread/mt_detector.cpp)
+    endif()
 endif()
 
 if(TensorRT_FOUND)
@@ -57,17 +68,41 @@ find_package(rclcpp QUIET)
 find_package(std_msgs QUIET)
 find_package(visualization_msgs QUIET)
 
-add_subdirectory(planner/tinympc)
+if(WIN32)
+    # Windows gestalt 分支：tinympc 不构建，提供空 INTERFACE 目标保持链接一致
+    add_library(tinympcstatic INTERFACE)
+else()
+    add_subdirectory(planner/tinympc)
+endif()
 
 add_library(auto_aim OBJECT ${AUTO_AIM_SOURCES})
 
-# 基础链接
-target_link_libraries(auto_aim io tinympcstatic)
+# 基础链接（Windows gestalt 分支不构建 io 硬件库，auto_aim 只用到 io 的头文件）
+if(NOT WIN32)
+    target_link_libraries(auto_aim PUBLIC io)
+endif()
+target_link_libraries(auto_aim PUBLIC tinympcstatic)
+
+# include 传播：Windows/vcpkg 不提供系统 include 路径，须经 target 暴露
+# fmt/spdlog/yaml-cpp 头文件（Linux 系统包在默认路径，行为不变）
+target_link_libraries(auto_aim PUBLIC fmt::fmt spdlog::spdlog yaml-cpp)
+if(WIN32)
+    # MSVC 默认不定义 M_PI，yaw_eskf/measurement_noise 等头文件依赖它
+    target_compile_definitions(auto_aim PRIVATE _USE_MATH_DEFINES)
+    # Windows 兼容 shim：sched.h（CPU 亲和性 no-op）、serial 纯头 include 路径、
+    # fmt 枚举 formatter（/FI 强制预包含，见 thirdparty/win_shims/）。
+    # PUBLIC：gestalt 编译头文件链（aimer.hpp -> cboard.hpp -> serial.h）也需要。
+    target_include_directories(auto_aim PUBLIC
+        ${PROJECT_SOURCE_DIR}/thirdparty/win_shims
+        ${PROJECT_SOURCE_DIR}/io/serial/include)
+    target_compile_options(auto_aim PRIVATE
+        /FI"${PROJECT_SOURCE_DIR}/thirdparty/win_shims/win_fmt_enum.hpp")
+endif()
 
 # 条件链接：OpenVINO
 if(OpenVINO_FOUND)
     target_compile_definitions(auto_aim PUBLIC ENABLE_OPENVINO)
-    target_link_libraries(auto_aim openvino::runtime)
+    target_link_libraries(auto_aim PUBLIC openvino::runtime)
     message(STATUS "[auto_aim] OpenVINO support enabled")
 endif()
 
@@ -87,7 +122,7 @@ if(TensorRT_FOUND)
     endif()
 
     # 链接 TensorRT 库
-    target_link_libraries(auto_aim ${TensorRT_LIBRARIES})
+    target_link_libraries(auto_aim PUBLIC ${TensorRT_LIBRARIES})
 
     # 设置 CUDA 架构（继承主 CMakeLists 的设置）
     if(CMAKE_CUDA_ARCHITECTURES)
@@ -101,7 +136,7 @@ endif()
 if(ament_cmake_FOUND AND rclcpp_FOUND AND std_msgs_FOUND AND visualization_msgs_FOUND)
     message(STATUS "[auto_aim] ROS2 support enabled for tracker marker visualization")
     target_compile_definitions(auto_aim PRIVATE AMENT_CMAKE_FOUND)
-    target_link_libraries(auto_aim rclcpp::rclcpp)
+    target_link_libraries(auto_aim PUBLIC rclcpp::rclcpp)
     ament_target_dependencies(auto_aim rclcpp std_msgs visualization_msgs)
 else()
     message(STATUS "[auto_aim] ROS2 not available, tracker marker visualization disabled")

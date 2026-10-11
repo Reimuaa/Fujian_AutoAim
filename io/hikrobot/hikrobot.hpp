@@ -31,6 +31,8 @@ private:
   double exposure_us_;
   double gain_;
   double frame_rate_;
+  double frame_time_offset_ms_;
+  bool frame_time_diagnostics_enabled_;
   int64_t width_;
   int64_t height_;
   unsigned int white_balance_auto_;

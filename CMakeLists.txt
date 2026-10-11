@@ -61,11 +61,21 @@ find_package(OpenCV 4.5 REQUIRED)
 
 find_package(fmt REQUIRED)
 find_package(Eigen3 REQUIRED)
+# vcpkg 以 imported target 提供 Eigen3（不设置 EIGEN3_INCLUDE_DIR 变量），
+# 从 target 提取 include 目录供下方全局 include_directories 使用。
+if(NOT EIGEN3_INCLUDE_DIR AND TARGET Eigen3::Eigen)
+  get_target_property(_eigen3_inc Eigen3::Eigen INTERFACE_INCLUDE_DIRECTORIES)
+  if(_eigen3_inc)
+    list(GET _eigen3_inc 0 EIGEN3_INCLUDE_DIR)
+  endif()
+endif()
 find_package(spdlog REQUIRED)
 find_package(yaml-cpp REQUIRED)
 find_package(nlohmann_json REQUIRED)
-# 尝试查找 OpenVINO（可选）
-set(OpenVINO_DIR "/opt/intel/openvino_2024.6.0/runtime/cmake/")
+# 尝试查找 OpenVINO（可选；Windows 分支由 -DOpenVINO_DIR 传入，此处不覆盖）
+if(NOT DEFINED OpenVINO_DIR AND NOT WIN32)
+  set(OpenVINO_DIR "/opt/intel/openvino_2024.6.0/runtime/cmake/")
+endif()
 find_package(OpenVINO QUIET COMPONENTS Runtime)
 
 if(OpenVINO_FOUND)
@@ -173,6 +183,36 @@ find_package(visualization_msgs QUIET)
 find_package(tf2_ros QUIET)
 find_package(geometry_msgs QUIET)
 
+if(WIN32)
+  # ---- Windows / Gestalt simulator build (bridge-style minimal) ----
+  # Only the algorithm chain (tools + auto_aim) and the GameIO backend are
+  # built.  Physical hardware layers (io/), the energy-rack module (auto_buff)
+  # and librm are not used by the simulator and stay Linux-only.
+  add_subdirectory(tools)
+  add_subdirectory(tasks/auto_aim)
+  add_subdirectory(tasks/omniperception)
+
+  if(NOT OpenVINO_FOUND)
+    message(FATAL_ERROR
+      "OpenVINO is required for the Windows gestalt build. "
+      "Pass -DOpenVINO_DIR=<python site-packages>/openvino/cmake")
+  endif()
+
+  # gestalt: original auto_aim core + GameIO backend (DXGI capture + WebSocket)
+  add_executable(gestalt
+    src/gestalt.cpp
+    io/gestalt/game_link.cpp
+    io/gestalt/shared_frame_capture.cpp
+    io/gestalt/win_capture.cpp
+    thirdparty/easywsclient/easywsclient.cpp)
+  target_include_directories(gestalt PRIVATE thirdparty/easywsclient)
+  target_link_libraries(gestalt
+    ${OpenCV_LIBS} fmt::fmt spdlog::spdlog yaml-cpp
+    openvino::runtime auto_aim tools
+    d3d11 dxgi ws2_32 iphlpapi)
+  target_compile_options(gestalt PRIVATE /utf-8)
+  target_compile_definitions(gestalt PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _USE_MATH_DEFINES)
+else()
 add_subdirectory(tools)
 add_subdirectory(io)
 add_subdirectory(tasks/auto_aim)
@@ -394,3 +434,5 @@ target_link_libraries(
   tools
   io
 )
+
+endif()  # WIN32 / Linux split

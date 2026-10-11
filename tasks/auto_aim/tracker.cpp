@@ -44,6 +44,14 @@ Tracker::Tracker(const std::string & config_path, Solver & solver)
     association_max_cost_ = std::clamp(
       yaml["tracker_association_max_cost"].as<double>(), 0.05, 20.0);
   }
+  if (yaml["tracker_identity_fallback_enabled"]) {
+    identity_fallback_enabled_ = yaml["tracker_identity_fallback_enabled"].as<bool>();
+  }
+  if (yaml["tracker_identity_fallback_max_cost"]) {
+    identity_fallback_max_cost_ = std::clamp(
+      yaml["tracker_identity_fallback_max_cost"].as<double>(),
+      0.05, association_max_cost_);
+  }
   if (yaml["tracker_batch_max_observations"]) {
     batch_max_observations_ = std::clamp(
       yaml["tracker_batch_max_observations"].as<int>(), 1, 4);
@@ -55,6 +63,23 @@ Tracker::Tracker(const std::string & config_path, Solver & solver)
   if (yaml["tracker_target_switch_min_frames"]) {
     target_switch_min_frames_ = std::clamp(
       yaml["tracker_target_switch_min_frames"].as<int>(), 1, 30);
+  }
+  if (yaml["tracker_center_acceleration_variance"]) {
+    center_process_config_.acceleration_variance = std::clamp(
+      yaml["tracker_center_acceleration_variance"].as<double>(), 0.01, 1000.0);
+  }
+  if (yaml["tracker_gyro_center_process_noise_enabled"]) {
+    center_process_config_.gyro_adaptive_enabled =
+      yaml["tracker_gyro_center_process_noise_enabled"].as<bool>();
+  }
+  if (yaml["tracker_gyro_center_rate_threshold_rad_s"]) {
+    center_process_config_.gyro_rate_threshold_rad_s = std::clamp(
+      yaml["tracker_gyro_center_rate_threshold_rad_s"].as<double>(), 0.1, 20.0);
+  }
+  if (yaml["tracker_gyro_center_acceleration_variance"]) {
+    center_process_config_.gyro_acceleration_variance = std::clamp(
+      yaml["tracker_gyro_center_acceleration_variance"].as<double>(),
+      0.01, center_process_config_.acceleration_variance);
   }
   if (yaml["yaw_eskf_angular_jerk_variance"]) {
     yaw_eskf_config_.angular_jerk_variance = std::clamp(
@@ -112,9 +137,53 @@ int Tracker::primary_detection_index() const { return primary_detection_index_; 
 
 int Tracker::primary_face_id() const { return primary_face_id_; }
 
+const Armor * Tracker::primary_observation() const
+{
+  for (const auto & association : last_associations_) {
+    if (association.detection_index == primary_detection_index_ &&
+        association.used_for_update && association.observation) {
+      return &*association.observation;
+    }
+  }
+  return nullptr;
+}
+
+const Tracker::FrameDiagnostics & Tracker::frame_diagnostics() const
+{
+  return frame_diagnostics_;
+}
+
+void Tracker::capture_frame_diagnostics()
+{
+  const auto & ekf = target_.ekf();
+  if (ekf.x.size() == 0) return;
+
+  frame_diagnostics_.target_state_available = true;
+  frame_diagnostics_.target_name = target_.name;
+  frame_diagnostics_.target_armor_count = target_.armor_num();
+  frame_diagnostics_.state_after = ekf.x;
+  frame_diagnostics_.whole_nis = ekf.last_nis;
+  const auto nees = ekf.data.find("nees");
+  frame_diagnostics_.whole_nees = nees != ekf.data.end()
+    ? nees->second : std::numeric_limits<double>::quiet_NaN();
+  frame_diagnostics_.yaw_eskf_trusted = target_.yaw_eskf_trusted();
+  frame_diagnostics_.yaw_eskf_angle = target_.yaw_eskf_angle();
+  frame_diagnostics_.yaw_eskf_rate = target_.yaw_eskf_rate();
+  frame_diagnostics_.yaw_eskf_acceleration = target_.yaw_eskf_acceleration();
+  frame_diagnostics_.yaw_eskf_nis = target_.yaw_eskf_nis();
+  frame_diagnostics_.yaw_eskf_accepted = target_.yaw_eskf_accepted_updates();
+  frame_diagnostics_.yaw_eskf_rejected = target_.yaw_eskf_rejected_updates();
+  frame_diagnostics_.center_acceleration_variance =
+    target_.center_acceleration_variance();
+}
+
 std::list<Target> Tracker::track(
   std::list<Armor> & armors, std::chrono::steady_clock::time_point t, bool use_enemy_color)
 {
+  frame_diagnostics_ = FrameDiagnostics{};
+  last_associations_.clear();
+  primary_detection_index_ = -1;
+  primary_face_id_ = -1;
   auto dt = tools::delta_time(t, last_timestamp_);
   last_timestamp_ = t;
 
@@ -163,6 +232,8 @@ std::list<Target> Tracker::track(
 
   // 发散检测
   if (state_ != "lost" && target_.diverged()) {
+    frame_diagnostics_.diverged = true;
+    capture_frame_diagnostics();
     tools::logger()->debug("[Tracker] Target diverged!");
     state_ = "lost";
     return {};
@@ -191,6 +262,8 @@ std::list<Target> Tracker::track(
     }
 
     state_ = "lost";
+    frame_diagnostics_.nis_reset = true;
+    capture_frame_diagnostics();
     return {};
   }
 
@@ -204,6 +277,10 @@ std::tuple<omniperception::DetectionResult, std::list<Target>> Tracker::track(
   const std::vector<omniperception::DetectionResult> & detection_queue, std::list<Armor> & armors,
   std::chrono::steady_clock::time_point t, bool use_enemy_color)
 {
+  frame_diagnostics_ = FrameDiagnostics{};
+  last_associations_.clear();
+  primary_detection_index_ = -1;
+  primary_face_id_ = -1;
   omniperception::DetectionResult switch_target{std::list<Armor>(), t, 0, 0};
   omniperception::DetectionResult temp_target{std::list<Armor>(), t, 0, 0};
   if (!detection_queue.empty()) {
@@ -271,6 +348,8 @@ std::tuple<omniperception::DetectionResult, std::list<Target>> Tracker::track(
 
   // 发散检测
   if (state_ != "lost" && target_.diverged()) {
+    frame_diagnostics_.diverged = true;
+    capture_frame_diagnostics();
     tools::logger()->debug("[Tracker] Target diverged!");
     state_ = "lost";
     return {switch_target, {}};  // 返回switch_target和空的targets
@@ -357,30 +436,38 @@ bool Tracker::set_target(std::list<Armor> & armors, std::chrono::steady_clock::t
   if (is_balance) {
     Eigen::VectorXd P0_dig{{1, 64, 1, 64, 1, 64, 0.4, 100, 1, 1, 1}};
     target_ = Target(
-      armor, t, 0.2, 2, P0_dig, yaw_eskf_config_, iterated_update_config_);
+      armor, t, 0.2, 2, P0_dig, yaw_eskf_config_, iterated_update_config_,
+      center_process_config_);
   }
 
   else if (armor.name == ArmorName::outpost) {
     Eigen::VectorXd P0_dig{{1, 64, 1, 64, 1, 81, 0.4, 100, 1e-4, 0, 0}};
     target_ = Target(
-      armor, t, 0.2765, 3, P0_dig, yaw_eskf_config_, iterated_update_config_);
+      armor, t, 0.2765, 3, P0_dig, yaw_eskf_config_, iterated_update_config_,
+      center_process_config_);
   }
 
   else if (armor.name == ArmorName::base) {
     Eigen::VectorXd P0_dig{{1, 64, 1, 64, 1, 64, 0.4, 100, 1e-4, 0, 0}};
     target_ = Target(
-      armor, t, 0.3205, 3, P0_dig, yaw_eskf_config_, iterated_update_config_);
+      armor, t, 0.3205, 3, P0_dig, yaw_eskf_config_, iterated_update_config_,
+      center_process_config_);
   }
 
   else {
-    Eigen::VectorXd P0_dig{{1, 64, 1, 64, 1, 64, 0.4, 100, 1, 1, 1}};
+    Eigen::VectorXd P0_dig{{0.1, 64, 0.1, 64, 0.1, 64, 0.4, 100, 0.01, 0.01, 0.01}};
     target_ = Target(
-      armor, t, 0.2, 4, P0_dig, yaw_eskf_config_, iterated_update_config_);
+      armor, t, 0.2, 4, P0_dig, yaw_eskf_config_, iterated_update_config_,
+      center_process_config_);
   }
 
-  last_associations_.push_back({selected_detection_index, 0, 0.0});
+  last_associations_.push_back({
+    selected_detection_index, 0, 0.0, false, armor.name, armor.type, false, armor, true});
   primary_detection_index_ = selected_detection_index;
   primary_face_id_ = 0;
+  frame_diagnostics_.initialized_this_frame = true;
+  frame_diagnostics_.state_before = target_.ekf().x;
+  capture_frame_diagnostics();
 
   return true;
 }
@@ -430,10 +517,14 @@ bool Tracker::should_switch_target(const std::list<Armor> & armors)
 bool Tracker::update_target(std::list<Armor> & armors, std::chrono::steady_clock::time_point t)
 {
   target_.predict(t);
+  frame_diagnostics_.target_state_available = target_.ekf().x.size() != 0;
+  frame_diagnostics_.state_before = target_.ekf().x;
 
   last_associations_.clear();
   primary_detection_index_ = -1;
   primary_face_id_ = -1;
+  frame_diagnostics_.association_input_detections = static_cast<int>(armors.size());
+  frame_diagnostics_.association_cost_threshold = association_max_cost_;
 
   // Associate in the image plane against every rigid-body face, then update
   // the EKF once with the best observation.  The old loop updated the same EKF
@@ -448,61 +539,152 @@ bool Tracker::update_target(std::list<Armor> & armors, std::chrono::steady_clock
     int face_id = -1;
     double cost = std::numeric_limits<double>::infinity();
     double alignment_rad = std::numeric_limits<double>::infinity();
+    bool identity_fallback = false;
+    ArmorName observed_name = ArmorName::not_armor;
+    ArmorType observed_type = ArmorType::small;
+    bool identity_fallback_type_corrected = false;
   };
   std::vector<Candidate> candidates;
-  int detection_index = 0;
-  for (auto & armor : armors) {
-    const int current_detection_index = detection_index++;
-    if (armor.name != target_.name || armor.type != target_.armor_type) continue;
+  std::vector<Armor> fallback_armors;
+  fallback_armors.reserve(armors.size());
+  const auto collect_candidates = [&](bool identity_fallback) {
+    int detection_index = 0;
+    for (auto & armor : armors) {
+      const int current_detection_index = detection_index++;
+      const auto observed_name = armor.name;
+      const auto observed_type = armor.type;
+      const bool exact_identity =
+        observed_name == target_.name && observed_type == target_.armor_type;
+      if (!identity_fallback && armor.name == target_.name) {
+        ++frame_diagnostics_.association_same_identity_detections;
+        if (armor.type == target_.armor_type) {
+          ++frame_diagnostics_.association_type_compatible_detections;
+        }
+      }
+      if (!identity_fallback && !exact_identity) continue;
+      if (identity_fallback && exact_identity) continue;
 
-    solver_.solve(armor);
-    const double observed_range_m = std::max(0.05, armor.ypd_in_world[2]);
-    const double detection_scale_px = std::max(
-      30.0, std::sqrt(std::max(1.0, static_cast<double>(armor.box.area()))));
-    cv::Point2f observed_center = armor.center;
-    if (!armor.points.empty()) {
-      observed_center = cv::Point2f(0.0F, 0.0F);
-      for (const auto & point : armor.points) observed_center += point;
-      observed_center *= 1.0F / static_cast<float>(armor.points.size());
-    }
+      Armor * association_armor = &armor;
+      bool type_corrected = false;
+      if (identity_fallback) {
+        // Keep the detector result intact for diagnostics.  The tracked robot
+        // cannot change armor identity, so evaluate a local copy with the
+        // established physical plate model before applying the strict fallback
+        // geometry threshold.
+        fallback_armors.push_back(armor);
+        association_armor = &fallback_armors.back();
+        type_corrected = association_armor->type != target_.armor_type;
+        association_armor->name = target_.name;
+        association_armor->type = target_.armor_type;
+      }
 
-    for (std::size_t id = 0; id < predicted_faces.size(); ++id) {
-      const auto & face = predicted_faces[id];
-      const auto projected = solver_.reproject_armor(
-        face.head(3), face[3], target_.armor_type, target_.name);
-      if (projected.empty()) continue;
+      solver_.solve(*association_armor);
+      const double observed_range_m = std::max(0.05, association_armor->ypd_in_world[2]);
+      const double detection_scale_px = std::max(
+        30.0, std::sqrt(std::max(1.0, static_cast<double>(association_armor->box.area()))));
+      cv::Point2f observed_center = association_armor->center;
+      if (!association_armor->points.empty()) {
+        observed_center = cv::Point2f(0.0F, 0.0F);
+        for (const auto & point : association_armor->points) observed_center += point;
+        observed_center *= 1.0F / static_cast<float>(association_armor->points.size());
+      }
 
-      cv::Point2f projected_center(0.0F, 0.0F);
-      for (const auto & point : projected) projected_center += point;
-      projected_center *= 1.0F / static_cast<float>(projected.size());
+      for (std::size_t id = 0; id < predicted_faces.size(); ++id) {
+        const auto & face = predicted_faces[id];
+        const auto projected = solver_.reproject_armor(
+          face.head(3), face[3], target_.armor_type, target_.name);
+        if (projected.empty()) continue;
+        if (!identity_fallback) ++frame_diagnostics_.association_projected_pairs;
 
-      const double center_error =
-        cv::norm(observed_center - projected_center) / detection_scale_px;
-      const double angle_error = std::abs(tools::limit_rad(
-        armor.ypr_in_world[0] - face[3])) / (20.0 * CV_PI / 180.0);
-      const double predicted_range_m = std::max(
-        0.05, tools::xyz2ypd(face.head(3))[2]);
-      const double range_error =
-        std::abs(std::log(observed_range_m / predicted_range_m)) / 0.25;
-      const double confidence_bonus = 0.10 * std::clamp(armor.confidence, 0.0, 1.0);
-      const double cost = center_error * center_error +
-        0.20 * angle_error * angle_error +
-        0.20 * range_error * range_error - confidence_bonus;
-      if (std::isfinite(cost) && cost <= association_max_cost_) {
-        const auto state = target_.ekf_x();
-        const double center_yaw = std::atan2(state[2], state[0]);
-        candidates.push_back({
-          &armor, current_detection_index, static_cast<int>(id), cost,
-          std::abs(tools::limit_rad(face[3] - center_yaw))});
+        cv::Point2f projected_center(0.0F, 0.0F);
+        for (const auto & point : projected) projected_center += point;
+        projected_center *= 1.0F / static_cast<float>(projected.size());
+
+        const double center_error =
+          cv::norm(observed_center - projected_center) / detection_scale_px;
+        const double angle_error = std::abs(tools::limit_rad(
+          association_armor->ypr_in_world[0] - face[3])) / (20.0 * CV_PI / 180.0);
+        const double predicted_range_m = std::max(
+          0.05, tools::xyz2ypd(face.head(3))[2]);
+        const double range_error =
+          std::abs(std::log(observed_range_m / predicted_range_m)) / 0.25;
+        const double confidence_bonus =
+          0.10 * std::clamp(association_armor->confidence, 0.0, 1.0);
+        const double cost = center_error * center_error +
+          0.20 * angle_error * angle_error +
+          0.20 * range_error * range_error - confidence_bonus;
+        if (!identity_fallback) {
+          if (!std::isfinite(cost)) {
+            ++frame_diagnostics_.association_nonfinite_pairs;
+          } else {
+            if (cost > association_max_cost_) {
+              ++frame_diagnostics_.association_over_cost_pairs;
+            }
+            if (!std::isfinite(frame_diagnostics_.association_best_cost) ||
+                cost < frame_diagnostics_.association_best_cost) {
+              frame_diagnostics_.association_best_detection = current_detection_index;
+              frame_diagnostics_.association_best_face = static_cast<int>(id);
+              frame_diagnostics_.association_best_observed_name = observed_name;
+              frame_diagnostics_.association_best_cost = cost;
+              frame_diagnostics_.association_best_center_error = center_error;
+              frame_diagnostics_.association_best_angle_error = angle_error;
+              frame_diagnostics_.association_best_range_error = range_error;
+              frame_diagnostics_.association_best_confidence_bonus = confidence_bonus;
+              frame_diagnostics_.association_best_within_threshold =
+                cost <= association_max_cost_;
+            }
+          }
+        }
+        if (identity_fallback && std::isfinite(cost) &&
+            (!std::isfinite(frame_diagnostics_.identity_fallback_best_cost) ||
+             cost < frame_diagnostics_.identity_fallback_best_cost)) {
+          frame_diagnostics_.identity_fallback_best_cost = cost;
+          frame_diagnostics_.identity_fallback_observed_name = observed_name;
+          frame_diagnostics_.identity_fallback_observed_type = observed_type;
+          frame_diagnostics_.identity_fallback_best_type_corrected = type_corrected;
+        }
+        const double max_cost = identity_fallback
+          ? identity_fallback_max_cost_ : association_max_cost_;
+        if (std::isfinite(cost) && cost <= max_cost) {
+          const auto state = target_.ekf_x();
+          const double center_yaw = std::atan2(state[2], state[0]);
+          candidates.push_back({
+            association_armor, current_detection_index, static_cast<int>(id), cost,
+            std::abs(tools::limit_rad(face[3] - center_yaw)), identity_fallback,
+            observed_name, observed_type, type_corrected});
+        }
       }
     }
+  };
+
+  collect_candidates(false);
+  if (!candidates.empty()) {
+    frame_diagnostics_.association_reject_reason = "none";
+  } else if (frame_diagnostics_.association_input_detections == 0) {
+    frame_diagnostics_.association_reject_reason = "no_detection";
+  } else if (frame_diagnostics_.association_same_identity_detections == 0) {
+    frame_diagnostics_.association_reject_reason = "name_mismatch";
+  } else if (frame_diagnostics_.association_type_compatible_detections == 0) {
+    frame_diagnostics_.association_reject_reason = "type_mismatch";
+  } else if (frame_diagnostics_.association_projected_pairs == 0) {
+    frame_diagnostics_.association_reject_reason = "projection_failed";
+  } else if (!std::isfinite(frame_diagnostics_.association_best_cost)) {
+    frame_diagnostics_.association_reject_reason = "nonfinite_cost";
+  } else {
+    frame_diagnostics_.association_reject_reason = "cost_threshold";
+  }
+  if (candidates.empty() && identity_fallback_enabled_ && target_.convergened()) {
+    // A tracked robot cannot change its armor number.  When the detector
+    // temporarily labels the same small armor as another robot class, retain
+    // the established target model and accept only a stricter geometric match.
+    collect_candidates(true);
   }
 
   // Solve the complete one-to-one assignment.  A greedy lowest-pair-first
   // choice can consume the only plausible detection for one face and force a
   // bad handover on another.  There are at most four faces, so an exhaustive
   // minimum-cost assignment is both deterministic and inexpensive.
-  std::vector<bool> detection_used(static_cast<std::size_t>(detection_index), false);
+  std::vector<bool> detection_used(armors.size(), false);
   std::vector<Candidate> current_assignment;
   std::vector<Candidate> selected;
   double best_assignment_cost = std::numeric_limits<double>::infinity();
@@ -533,7 +715,10 @@ bool Tracker::update_target(std::list<Armor> & armors, std::chrono::steady_clock
   };
   assign_face(0, 0.0);
 
-  if (selected.empty()) return false;
+  if (selected.empty()) {
+    capture_frame_diagnostics();
+    return false;
+  }
   const auto primary_it = std::min_element(
     selected.begin(), selected.end(), [](const Candidate & a, const Candidate & b) {
       if (std::abs(a.alignment_rad - b.alignment_rad) > 1e-6) {
@@ -543,6 +728,16 @@ bool Tracker::update_target(std::list<Armor> & armors, std::chrono::steady_clock
     });
   primary_detection_index_ = primary_it->detection_index;
   primary_face_id_ = primary_it->face_id;
+  frame_diagnostics_.identity_fallback_used = std::any_of(
+    selected.begin(), selected.end(),
+    [](const Candidate & candidate) { return candidate.identity_fallback; });
+  frame_diagnostics_.identity_fallback_used_type_corrected = std::any_of(
+    selected.begin(), selected.end(), [](const Candidate & candidate) {
+      return candidate.identity_fallback && candidate.identity_fallback_type_corrected;
+    });
+  if (frame_diagnostics_.identity_fallback_used) {
+    frame_diagnostics_.association_reject_reason = "identity_fallback";
+  }
 
   // Preserve the proven single-observation path on fixed and slow targets.
   // Joint observations are enabled only after the target is clearly in gyro
@@ -556,25 +751,35 @@ bool Tracker::update_target(std::list<Armor> & armors, std::chrono::steady_clock
   std::vector<std::pair<Armor, int>> batch;
   batch.reserve(use_batch ? selected.size() : 1);
   for (const auto & association : selected) {
+    const bool used_for_update =
+      use_batch || association.detection_index == primary_detection_index_;
     last_associations_.push_back({
-      association.detection_index, association.face_id, association.cost});
-    if (use_batch || association.detection_index == primary_detection_index_) {
+      association.detection_index, association.face_id, association.cost,
+      association.identity_fallback, association.observed_name, association.observed_type,
+      association.identity_fallback_type_corrected, *association.armor, used_for_update});
+    if (used_for_update) {
       batch.emplace_back(*association.armor, association.face_id);
     }
   }
 
+  frame_diagnostics_.update_attempted = true;
+  frame_diagnostics_.update_used_batch = use_batch;
+  frame_diagnostics_.update_observations = static_cast<int>(batch.size());
+
   static int association_log_counter = 0;
   if (++association_log_counter % 50 == 0) {
     tools::logger()->info(
-      "[ASSOC] primary_face={} matches={} cost={:.3f} detections={} confidence={:.2f}",
+      "[ASSOC] primary_face={} matches={} cost={:.3f} detections={} confidence={:.2f} "
+      "identity_fallback={}",
       primary_face_id_, batch.size(), primary_it->cost, armors.size(),
-      primary_it->armor->confidence);
+      primary_it->armor->confidence, frame_diagnostics_.identity_fallback_used);
   }
   if (use_batch) {
     target_.update_batch(batch, primary_face_id_);
   } else {
     target_.update(*primary_it->armor, primary_face_id_);
   }
+  capture_frame_diagnostics();
   return true;
 }
 

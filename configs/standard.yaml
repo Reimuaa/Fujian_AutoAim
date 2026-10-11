@@ -63,15 +63,15 @@ yolo26_color_min_brightness: 30
 yolo26_color_min_pixels_per_bar: 6
 yolo26_color_hold_frames: 20
 detector_debug: false
-# 步兵现场诊断：以同帧编号关联检测、跟踪、yaw 指令和原始画面。
-# 最多记录 3000 条摘要（约 10 Hz）及 20 张丢失画面，分别写入 logs/ 和 data/。
-infantry_diagnostics_enabled: true
+# 排查时改为 true：记录帧/IMU、检测、跟踪、双轴指令及反馈，最多 3000 条摘要和 20 张丢失画面。
+# 正式运行保持 false，避免同步刷盘和图片编码影响下一帧。
+infantry_diagnostics_enabled: false
 
 use_traditional: true
 # YOLO26 previously ignored use_traditional.  The adaptive two-light-bar
 # refiner now uses it as the default enable and safely keeps network corners
 # whenever no geometrically consistent image candidate is found.
-yolo26_refine_corners: true
+yolo26_refine_corners: false
 corner_refine_roi_length_scale: 1.8
 corner_refine_roi_width_scale: 0.9
 corner_refine_max_center_error_ratio: 0.65
@@ -86,11 +86,11 @@ force_auto_aim: true
 #####-----ROI（感兴趣区域）参数-----#####
 roi:
   x: 420
-  y: 50
+  y: 300
   width: 600
   height: 600
 
-use_roi: false
+use_roi: true
 
 #####-----传统检测方法参数-----#####
 threshold: 100
@@ -106,10 +106,22 @@ max_rectangular_error: 25
 #####-----Tracker（跟踪器）参数-----#####
 min_detect_count: 5
 tracker_association_max_cost: 2.0
+# Keep an already converged physical target through transient digit/class
+# mistakes. Exact-name association remains first choice; fallback uses the
+# stricter geometric cost below and retains the established vehicle model.
+tracker_identity_fallback_enabled: true
+tracker_identity_fallback_max_cost: 0.75
 tracker_batch_max_observations: 4
 # Fuse multiple rigid-body faces in both vehicle and high-speed modes.
 tracker_batch_min_omega_rad_s: 1.5
 tracker_target_switch_min_frames: 3
+# Rotating armor PnP depth bias must not be interpreted as rapid chassis
+# acceleration. Constant center velocity remains observable with the lower
+# process noise, while false vx/vy is suppressed through face hand-over.
+tracker_center_acceleration_variance: 100.0
+tracker_gyro_center_process_noise_enabled: true
+tracker_gyro_center_rate_threshold_rad_s: 0.8
+tracker_gyro_center_acceleration_variance: 10.0
 # Robust iterated whole-vehicle update.  Yaw remains federated with YawESKF.
 whole_state_iekf_enabled: true
 whole_state_iekf_max_iterations: 4
@@ -135,8 +147,8 @@ comming_angle: 60
 leaving_angle: 20
 
 decision_speed: 0.8
-# Field feedback explicitly selected an 85 ms command-to-impact prediction.
-# Keep high- and low-speed prediction on the same physical calibration.
+# Base prediction: 85 ms delay plus projectile flight time.
+# Keep both Aimer speed branches equal; event timing is configured separately.
 high_speed_delay_time: 0.085
 low_speed_delay_time: 0.085
 
@@ -157,6 +169,7 @@ auto_fire: true
 camera_name: "hikrobot"
 
 exposure_ms: 6.0
+hikrobot_capture_to_exposure_ms: 0.0  # GetImageBuffer接收时刻到曝光中心；快速转云台实测后填写
 gain: 16.0
 camera_width: 1440
 camera_height: 1080
@@ -215,15 +228,17 @@ xuc_imu_yaw_sign: -1.06298816    # 零roll三点实测：下位机原始yaw -> �
 xuc_imu_pitch_sign: 1            # 下位机IMU pitch方向，实机小角度确认
 xuc_imu_yaw_offset_rad: 0.0
 xuc_imu_pitch_offset_rad: 0.0
+xuc_imu_alignment_ms: 15.0       # 正值查询更晚的IMU姿态；静态靶快转初测约12–19ms，待复测
 xuc_require_feedback_for_control: true
 xuc_require_auto_mode_for_control: true   # 仅在下位机回传mode=1时允许控制和发弹
 xuc_max_yaw_excursion_rad: 0.0          # 双轴联调：上位机不额外截断，下位机保留 Yaw ±25°/实际±28°保护
 xuc_lock_pitch_for_control: false       # 允许下发 Pitch；下位机限制 ±15°/80°每秒
 xuc_allow_control: true             # low-light yaw/pitch follow test
-xuc_allow_shoot: true               # explicit single-shot live test
-xuc_shoot_hold_ms: 550.0            # omni-code仅实现shoot=1；500rpm下4.5圈拨弹约需540ms
+xuc_allow_shoot: true               # 弹道偏高实弹测量；由现场操作员启动
+xuc_shoot_hold_ms: 450.0            # 下位机单发协议：满足开火条件后持续发送shoot=1 450ms
+xuc_shoot_low_ms: 550.0             # 首个成功shoot=0包后保持低电平550ms，结束后重新判定开火
 xuc_fire_guard_enabled: true       # require fresh measured armor in both axes
-xuc_fire_stable_ms: 120.0          # short debounce; 800ms command rearm handles repetition
+xuc_fire_stable_ms: 120.0          # short debounce; single-shot command cycle handles repetition
 xuc_fire_yaw_tolerance_deg: 3.0    # 0.91m约±4.8cm，仍在小装甲板水平范围内
 xuc_fire_pitch_tolerance_deg: 1.1  # 介于无射击的0.8°与明显低弹的2.0°之间；配合更强Pitch闭环
 xuc_gyro_center_follow_enabled: true
@@ -258,7 +273,7 @@ xuc_gyro_predicted_fire_enabled: true
 # while the physical phase event clock is unlocked.  This prevents event=0,
 # cycle=-1 rounds such as shots 1-20 in the 2026-09-11 23:34 field log.
 xuc_gyro_require_event_lock_for_fire: true
-xuc_gyro_predicted_yaw_tolerance_deg: 3.0
+xuc_gyro_predicted_yaw_tolerance_deg: 0.5
 xuc_gyro_predicted_yaw_trim_deg: 0.0
 xuc_gyro_visibility_yaw_tolerance_deg: 8.0
 xuc_gyro_fire_min_consecutive_frames: 2
@@ -284,16 +299,16 @@ xuc_direct_pitch_guard: true             # 使用装甲板像素纵向误差 + �
 xuc_direct_pitch_filter_tau_ms: 60.0     # retain post-shot noise damping without the observed long vertical lag
 xuc_direct_pitch_hold_ms: 180.0          # 已保存双轴验收值：短丢帧保持
 xuc_direct_pitch_max_rate_dps: 45.0      # midpoint between the stable-but-slow 25 and previously validated 80 deg/s
-xuc_direct_pitch_error_gain: 1.35        # recover steady-state authority; below the previously validated 1.65 gain
-xuc_projectile_speed_mps: 19.36          # 6500rpm初值：9.53m/s * 6500/3200；必须以测速/落点复核
+xuc_direct_pitch_error_gain: 1.35        # 弹道偏高单变量复测：与2.0对照，其余参数保持不变
+xuc_projectile_speed_mps: 28.0           # 弹道模型试验值，尚未测速；仅用静止靶对照
 xuc_ballistic_reference_projectile_speed_mps: 10.0  # 0.91m/17cm实弹基准采集于2500rpm，禁止随当前转速重算
-xuc_ballistic_pitch_enabled: true
+xuc_ballistic_pitch_enabled: true   # XUC直接俯仰弹道补偿开启；对照28m/s试验值
 xuc_camera_forward_of_muzzle_m: 0.06     # 实测：相机中心在炮口前方 6 cm
 xuc_camera_above_muzzle_m: 0.04          # 实测：相机中心在炮口上方 4 cm
 xuc_ballistic_reference_camera_range_m: 0.91
 xuc_ballistic_reference_total_drop_m: 0.08639  # physical 10m/s reference; zero fixed boresight bias
 xuc_ballistic_max_compensation_deg: 20.0    # 低弹速远距离补偿上限；下位机另保留25°/28°双层保护
-xuc_ballistic_pitch_trim_deg: 0.00     # 2026-09-22实弹稳定偏下：撤销旧的固定向下弹着修正
+xuc_ballistic_pitch_trim_deg: 0.00     # 固定弹着微调为零；启用弹道模型时使用
 # Robust shared range for ballistic elevation and gyro time-of-flight.  The
 # rigid-body near-face range is authoritative; raw PnP depth contributes only a
 # bounded 5% correction so oblique plates cannot move the aim by metres.
@@ -367,4 +382,4 @@ xuc_event_require_face_consistency: false
 # the next face. A shot also requires the gimbal to be following its command.
 xuc_event_face_max_alignment_deg: 15.0
 xuc_event_gimbal_tracking_tolerance_deg: 4.0
-xuc_shot_rearm_ms: 800              # 下位机无拨弹反馈；命令开始后800ms允许下一发
+xuc_shot_rearm_ms: 0                # 0取消额外最小请求间隔；仍保留450ms高电平和550ms低电平
