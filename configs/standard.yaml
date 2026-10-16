@@ -65,7 +65,7 @@ yolo26_color_hold_frames: 20
 detector_debug: false
 # 排查时改为 true：记录帧/IMU、检测、跟踪、双轴指令及反馈，最多 3000 条摘要和 20 张丢失画面。
 # 正式运行保持 false，避免同步刷盘和图片编码影响下一帧。
-infantry_diagnostics_enabled: false
+infantry_diagnostics_enabled: true
 
 use_traditional: true
 # YOLO26 previously ignored use_traditional.  The adaptive two-light-bar
@@ -149,8 +149,8 @@ leaving_angle: 20
 decision_speed: 0.8
 # Base prediction: 85 ms delay plus projectile flight time.
 # Keep both Aimer speed branches equal; event timing is configured separately.
-high_speed_delay_time: 0.325
-low_speed_delay_time: 0.325
+high_speed_delay_time: 0.330
+low_speed_delay_time: 0.330
 
 actuation_delay_ms: 0
 
@@ -235,8 +235,8 @@ xuc_max_yaw_excursion_rad: 0.0          # 双轴联调：上位机不额外截�
 xuc_lock_pitch_for_control: false       # 允许下发 Pitch；下位机限制 ±15°/80°每秒
 xuc_allow_control: true             # low-light yaw/pitch follow test
 xuc_allow_shoot: true               # 弹道偏高实弹测量；由现场操作员启动
-xuc_shoot_hold_ms: 450.0            # 下位机单发协议：满足开火条件后持续发送shoot=1 450ms
-xuc_shoot_low_ms: 550.0             # 首个成功shoot=0包后保持低电平550ms，结束后重新判定开火
+xuc_shoot_hold_ms: 100.0            # 下位机单发协议：满足开火条件后持续发送shoot=1 100ms
+xuc_shoot_low_ms: 50.0             # 首个成功shoot=0包后保持低电平50ms，结束后重新判定开火
 xuc_fire_guard_enabled: true       # require fresh measured armor in both axes
 xuc_fire_stable_ms: 120.0          # short debounce; single-shot command cycle handles repetition
 xuc_fire_yaw_tolerance_deg: 3.0    # 0.91m约±4.8cm，仍在小装甲板水平范围内
@@ -244,6 +244,8 @@ xuc_fire_pitch_tolerance_deg: 1.1  # 介于无射击的0.8°与明显低弹的2.
 xuc_gyro_center_follow_enabled: true
 xuc_gyro_omega_threshold_rad_s: 0.8
 # Trust-aware armor -> vehicle -> phase-clock model selection.
+# Temporarily use vehicle prediction for all rotation speeds; retain armor mode.
+xuc_high_speed_phase_enabled: false
 xuc_vehicle_model_enter_rad_s: 0.8
 xuc_vehicle_model_exit_rad_s: 0.45
 xuc_high_speed_enter_rad_s: 3.2
@@ -273,7 +275,7 @@ xuc_gyro_predicted_fire_enabled: true
 # while the physical phase event clock is unlocked.  This prevents event=0,
 # cycle=-1 rounds such as shots 1-20 in the 2026-09-11 23:34 field log.
 xuc_gyro_require_event_lock_for_fire: true
-xuc_gyro_predicted_yaw_tolerance_deg: 0.5
+xuc_gyro_predicted_yaw_tolerance_deg: 0.6
 xuc_gyro_predicted_yaw_trim_deg: 0.0
 xuc_gyro_visibility_yaw_tolerance_deg: 8.0
 xuc_gyro_fire_min_consecutive_frames: 2
@@ -308,7 +310,7 @@ xuc_camera_above_muzzle_m: 0.04          # 实测：相机中心在炮口上方 
 xuc_ballistic_reference_camera_range_m: 0.91
 xuc_ballistic_reference_total_drop_m: 0.08639  # physical 10m/s reference; zero fixed boresight bias
 xuc_ballistic_max_compensation_deg: 20.0    # 低弹速远距离补偿上限；下位机另保留25°/28°双层保护
-xuc_ballistic_pitch_trim_deg: -0.50    # 固定向下微调；约3.2m处补偿弹着偏高8cm，待实弹复核
+xuc_ballistic_pitch_trim_deg: 0.0      # 取消固定俯仰微调，仅保留原有弹道补偿
 # Robust shared range for ballistic elevation and gyro time-of-flight.  The
 # rigid-body near-face range is authoritative; raw PnP depth contributes only a
 # bounded 5% correction so oblique plates cannot move the aim by metres.
@@ -382,4 +384,4 @@ xuc_event_require_face_consistency: false
 # the next face. A shot also requires the gimbal to be following its command.
 xuc_event_face_max_alignment_deg: 15.0
 xuc_event_gimbal_tracking_tolerance_deg: 4.0
-xuc_shot_rearm_ms: 0                # 0取消额外最小请求间隔；仍保留450ms高电平和550ms低电平
+xuc_shot_rearm_ms: 0                # 0取消额外最小请求间隔；仍保留100ms高电平和50ms低电平

@@ -81,6 +81,47 @@ int main()
   assert(result.mode == Manager::Mode::armor);
   assert(result.phase_reset);
 
+  // With phase mode disabled, crossing either old high-speed boundary must
+  // keep vehicle prediction, including when a phase clock is supplied.
+  Manager::Config two_mode_config;
+  two_mode_config.high_speed_phase_enabled = false;
+  two_mode_config.vehicle_exit_rad_s = 0.45;
+  two_mode_config.mode_dwell_s = 0.60;
+  two_mode_config.tracker_dropout_hold_s = 0.25;
+  Manager two_mode(two_mode_config);
+  result = two_mode.update(0.00, true, 0.0);
+  assert(result.mode == Manager::Mode::armor);
+  result = two_mode.update(0.70, true, 0.7);
+  assert(result.mode == Manager::Mode::armor);
+  result = two_mode.update(1.00, true, 4.5);
+  assert(result.mode == Manager::Mode::armor);
+  result = two_mode.update(1.61, true, 4.5);
+  assert(result.mode == Manager::Mode::vehicle && result.mode_changed);
+  assert(!result.phase_reset && !result.phase_fire_trusted);
+  double two_mode_time = 1.61;
+  for (double omega : {3.1, 3.3, 8.0, 2.6, 2.4, -4.5, -8.0, 0.6}) {
+    two_mode_time += 0.70;
+    result = two_mode.update(two_mode_time, true, omega, true, std::abs(omega));
+    assert(result.mode == Manager::Mode::vehicle && !result.mode_changed);
+    assert(!result.phase_reset && !result.phase_fire_trusted);
+  }
+  result = two_mode.update(two_mode_time + 0.10, false, 0.0);
+  assert(result.mode == Manager::Mode::vehicle && !result.tracker_trusted);
+  result = two_mode.update(two_mode_time + 0.20, true, 4.5);
+  assert(result.mode == Manager::Mode::vehicle && !result.mode_changed);
+  two_mode_time += 0.30;
+  result = two_mode.update(two_mode_time, true, 0.0);
+  assert(result.mode == Manager::Mode::vehicle);
+  result = two_mode.update(two_mode_time + 0.61, true, 0.0);
+  assert(result.mode == Manager::Mode::armor && result.mode_changed);
+  result = two_mode.update(two_mode_time + 0.70, true, -4.5);
+  assert(result.mode == Manager::Mode::armor);
+  result = two_mode.update(two_mode_time + 1.31, true, -4.5);
+  assert(result.mode == Manager::Mode::vehicle);
+  result = two_mode.update(two_mode_time + 1.60, false, 0.0);
+  assert(result.mode == Manager::Mode::armor && !result.tracker_trusted);
+  assert(!result.phase_reset && !result.phase_fire_trusted);
+
   std::cout << "rotation_model_manager_test: PASS\n";
   return 0;
 }

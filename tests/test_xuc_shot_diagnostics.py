@@ -15,6 +15,9 @@ SERIAL_STUB = r'''
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <algorithm>
+#include <deque>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -22,6 +25,12 @@ SERIAL_STUB = r'''
 namespace serial {
 inline int fail_writes = 0, short_writes = 0;
 inline std::vector<std::vector<uint8_t>> packets;
+inline std::mutex rx_mutex;
+inline std::deque<uint8_t> input;
+inline void inject(const std::vector<uint8_t> & bytes) {
+  std::lock_guard<std::mutex> lock(rx_mutex);
+  input.insert(input.end(),bytes.begin(),bytes.end());
+}
 enum flowcontrol_t { flowcontrol_none };
 enum parity_t { parity_none };
 enum stopbits_t { stopbits_one };
@@ -41,8 +50,12 @@ public:
  void open() { open_ = true; }
  void close() { open_ = false; }
  bool isOpen() const { return open_; }
- size_t read(uint8_t *, size_t) {
-   std::this_thread::sleep_for(std::chrono::milliseconds(1)); return 0;
+ size_t read(uint8_t * out, size_t size) {
+   std::this_thread::sleep_for(std::chrono::milliseconds(1));
+   std::lock_guard<std::mutex> lock(rx_mutex);
+   const auto n=std::min({size,input.size(),size_t(7)}); // Fragment wire frames.
+   for(size_t i=0;i<n;++i) { out[i]=input.front();input.pop_front(); }
+   return n;
  }
  size_t write(const uint8_t * p, size_t n) {
    if (fail_writes > 0) { --fail_writes; throw IOException("injected failure"); }
@@ -66,6 +79,7 @@ HARNESS = r'''
 #include <spdlog/sinks/base_sink.h>
 #include "io/xuc.hpp"
 #include "tools/logger.hpp"
+#include "tools/crc.hpp"
 using namespace std::chrono_literals;
 struct Capture : spdlog::sinks::base_sink<std::mutex> {
  std::vector<std::string> lines;
@@ -109,6 +123,60 @@ void snapshot(io::XucSender & x, uint64_t id) {
 int main(int argc, char ** argv) {
  assert(argc == 3);
  const auto threads = thread_count();
+ {
+   io::XucSender x(argv[2]);
+   // Real captured 30-byte idle packet. CRC and layout are independent of
+   // sizeof(XucTxPacket); an old 20-byte parser cannot pass this fixture.
+   std::vector<uint8_t> rx={0x53,0x50,0x00,0x67,0,0,0,0,0x16,0x7a,
+     0x33,0x0e,0x87,0x3e,0x0e,0xc0,0xc2,0x3e,0,0,0xa4,0x2b,0x14,0,
+     0xc0,0xff,0,0,0x3a,0xfd};
+   auto bad=rx;bad[29]^=1;serial::inject({0x12,0x53,0x01});serial::inject(bad);
+   std::this_thread::sleep_for(30ms);assert(!x.rx_valid());
+   serial::inject(rx);std::this_thread::sleep_for(30ms);
+   assert(x.rx_valid());assert(x.mode()==0);assert(x.robot_id()==103);
+   assert(x.bullet_count()==31254);
+   assert(std::abs(x.imu_pitch()-0.2637802064418793)<1e-7);
+   assert(std::abs(x.imu_yaw()-0.3803715109825134)<1e-7);
+   auto samples=x.take_shooter_feedback();assert(samples.size()==1);
+   assert(samples[0].fire_flag==0);assert(samples[0].fire_tick_ms==0x00142ba4);
+   assert(samples[0].friction_current_raw==-64);assert(samples[0].feeder_speed_rpm==0);
+   assert(samples[0].host_rx_ns==x.last_rx_ns());assert(x.take_shooter_feedback().empty());
+   // Explicit signed RPM must drive integration, independently of projectile speed=0.
+   rx[18]=1;rx[20]=0xf0;rx[21]=0xff;rx[22]=0xff;rx[23]=0xff;
+   rx[24]=0x2e;rx[25]=0xfb; // -1234 raw current
+   rx[26]=0xb0;rx[27]=0x04; // +1200 rotor RPM
+   auto crc=tools::get_crc16(rx.data(),28);rx[28]=crc&255;rx[29]=crc>>8;
+   serial::inject(rx);std::this_thread::sleep_for(20ms);
+   serial::inject(rx);std::this_thread::sleep_for(20ms);
+   assert(x.feeder_speed_rpm()==1200);assert(x.bullet_speed()==0);
+   assert(x.feeder_motor_turns_estimate()>0.1);
+   samples=x.take_shooter_feedback();assert(samples.size()==2);
+   assert(samples[0].fire_tick_ms==0xfffffff0u);assert(samples[0].friction_current_raw==-1234);
+   assert(samples[1].host_rx_ns>samples[0].host_rx_ns);
+   rx[26]=0x50;rx[27]=0xfb; // -1200 rotor RPM
+   crc=tools::get_crc16(rx.data(),28);rx[28]=crc&255;rx[29]=crc>>8;
+   serial::inject(rx);std::this_thread::sleep_for(20ms);assert(x.feeder_speed_rpm()==-1200);
+   assert(x.take_shooter_feedback()[0].feeder_speed_rpm==-1200);
+   // Bound pending waveform data when the sending thread is stalled.
+   for(int i=0;i<270;++i) serial::inject(rx);
+   const auto deadline=std::chrono::steady_clock::now()+3s;
+   while(x.valid_packets()<274 && std::chrono::steady_clock::now()<deadline)std::this_thread::sleep_for(5ms);
+   assert(x.valid_packets()==274);assert(x.shooter_feedback_dropped()==14);
+   assert(x.take_shooter_feedback().size()==256);
+   std::this_thread::sleep_for(520ms);assert(!x.rx_valid());
+   serial::inject(rx);std::this_thread::sleep_for(20ms);assert(x.rx_valid());
+   std::cout << "PASS 30-byte captured wire: idle heartbeat, fragmented frames, CRC, signed telemetry, bounded queue, timeout/recovery\n";
+ }
+ {
+   io::XucSender x(argv[1]);
+   std::vector<uint8_t> rx={0x53,0x50,0x00,0x67,0,0,0,0,0x16,0x7a,
+     0x33,0x0e,0x87,0x3e,0x0e,0xc0,0xc2,0x3e,0,0,0xa4,0x2b,0x14,0,
+     0xc0,0xff,0,0,0x3a,0xfd};
+   serial::inject(rx);std::this_thread::sleep_for(20ms);assert(x.rx_valid());
+   assert(x.take_shooter_feedback().empty());assert(x.shooter_feedback_dropped()==0);
+   assert(x.feeder_motor_turns_estimate()==0);
+ }
+ assert(events().empty());sink->lines.clear();serial::packets.clear();
  const io::Command start{true,true,0.3,-0.15}, follow{true,false,0.7,0.2};
  std::vector<std::vector<uint8_t>> compact;
  {

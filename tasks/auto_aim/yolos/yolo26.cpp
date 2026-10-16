@@ -206,7 +206,6 @@ YOLO26::YOLO26(const std::string & config_path, bool debug)
   int height = yaml["roi"]["height"].as<int>();
   use_roi_ = yaml["use_roi"].as<bool>();
   roi_ = cv::Rect(x, y, width, height);
-  offset_ = cv::Point2f(x, y);
 
   save_path_ = "imgs";
   std::filesystem::create_directory(save_path_);
@@ -281,6 +280,11 @@ YOLO26::YOLO26(const std::string & config_path, bool debug)
 
 std::list<Armor> YOLO26::detect(const cv::Mat & raw_img, int frame_count)
 {
+  return detect(raw_img, frame_count, false);
+}
+
+std::list<Armor> YOLO26::detect(const cv::Mat & raw_img, int frame_count, bool full_frame)
+{
   last_diagnostics_ = {};
   if (raw_img.empty()) {
     tools::logger()->warn("[YOLO26] Empty image, camera drop!");
@@ -301,13 +305,13 @@ std::list<Armor> YOLO26::detect(const cv::Mat & raw_img, int frame_count)
     model_img = color_converted_;
   }
 
-  if (use_roi_) {
+  cv::Rect detection_roi(0, 0, raw_img.cols, raw_img.rows);
+  if (use_roi_ && !full_frame) {
     if (roi_.width == -1) roi_.width = raw_img.cols;
     if (roi_.height == -1) roi_.height = raw_img.rows;
-    bgr_img = model_img(roi_);
-  } else {
-    bgr_img = model_img;
+    detection_roi = roi_;
   }
+  bgr_img = model_img(detection_roi);
 
   int orig_w = bgr_img.cols;
   int orig_h = bgr_img.rows;
@@ -352,7 +356,7 @@ std::list<Armor> YOLO26::detect(const cv::Mat & raw_img, int frame_count)
   auto output_shape = output_tensor.get_shape();
   cv::Mat output(output_shape[1], output_shape[2], CV_32F, output_tensor.data());
 
-  auto result = parse(scale, pad_x, pad_y, output, bgr_img, tmp_img, frame_count);
+  auto result = parse(scale, pad_x, pad_y, output, bgr_img, tmp_img, frame_count, detection_roi);
 
   auto t_postprocess_end = std::chrono::high_resolution_clock::now();
   auto duration_postprocess = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -386,7 +390,7 @@ std::list<Armor> YOLO26::detect(const cv::Mat & raw_img, int frame_count)
 // 🚀 优化后的parse函数：使用指针访问、预分配空间、减少类型转换
 std::list<Armor> YOLO26::parse(
   double scale, int pad_x, int pad_y, cv::Mat & output, const cv::Mat & bgr_img,
-  const cv::Mat & tmp_img, int frame_count)
+  const cv::Mat & tmp_img, int frame_count, const cv::Rect & detection_roi)
 {
   const int num_detections = output.rows;
   const int num_cols = output.cols;
@@ -521,24 +525,9 @@ std::list<Armor> YOLO26::parse(
   for (int i : indices) {
     sort_keypoints(armors_key_points[i]);
 
-    if (use_roi_) {
-      armors.emplace_back(
-        ids[i],
-        confidences[i],
-        boxes[i],
-        armors_key_points[i],
-        offset_,
-        YOLOVersion::YOLO26
-      );
-    } else {
-      armors.emplace_back(
-        ids[i],
-        confidences[i],
-        boxes[i],
-        armors_key_points[i],
-        YOLOVersion::YOLO26
-      );
-    }
+    armors.emplace_back(
+      ids[i], confidences[i], boxes[i], armors_key_points[i],
+      cv::Point2f(detection_roi.x, detection_roi.y), YOLOVersion::YOLO26);
     armors.back().keypoint_confidence = keypoint_confidences[i];
     if (refine_corners_) refine_corners(armors.back(), tmp_img);
     if (refine_color_) refine_color(armors.back(), tmp_img, frame_count);
@@ -592,7 +581,7 @@ std::list<Armor> YOLO26::parse(
 
   // 绘制检测结果
   if (debug_ && !tmp_img.empty()) {
-    draw_detections(tmp_img, armors, frame_count);
+    draw_detections(tmp_img, armors, frame_count, detection_roi);
   }
 
   return armors;
@@ -745,7 +734,8 @@ void YOLO26::sort_keypoints(std::vector<cv::Point2f> & keypoints)
 }
 
 void YOLO26::draw_detections(
-  const cv::Mat & img, const std::list<Armor> & armors, int frame_count) const
+  const cv::Mat & img, const std::list<Armor> & armors, int frame_count,
+  const cv::Rect & detection_roi) const
 {
   cv::Mat detection = img.clone();
   tools::draw_text(detection, fmt::format("[{}]", frame_count), {10, 30}, {255, 255, 255});
@@ -759,9 +749,9 @@ void YOLO26::draw_detections(
     tools::draw_text(detection, info, armor.center, {0, 255, 0});
   }
 
-  if (use_roi_) {
+  if (detection_roi != cv::Rect(0, 0, img.cols, img.rows)) {
     cv::Scalar green(0, 255, 0);
-    cv::rectangle(detection, roi_, green, 2);
+    cv::rectangle(detection, detection_roi, green, 2);
   }
 
   cv::resize(detection, detection, {}, 0.5, 0.5);
@@ -952,7 +942,8 @@ std::list<Armor> YOLO26::postprocess(
 {
   // postprocess 假设没有 letterbox padding（外部调用场景）
   // 使用bgr_img作为tmp_img（因为外部调用没有额外的原始图像）
-  return parse(scale, 0, 0, output, bgr_img, bgr_img, frame_count);
+  const cv::Rect detection_roi = use_roi_ ? roi_ : cv::Rect(0, 0, bgr_img.cols, bgr_img.rows);
+  return parse(scale, 0, 0, output, bgr_img, bgr_img, frame_count, detection_roi);
 }
 
 }  // namespace auto_aim

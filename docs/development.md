@@ -1,7 +1,7 @@
 # 工程架构与开发调试指南
 
 
-2026-10-11晚间发布：用户认可当前准确率；现有参数为Aimer延迟325ms、旋转门限0.5°、20m/s、P轴微调-0.50°、ROI和角点细化开启。高速事件延迟仍85ms。灾后恢复见[快速恢复](recovery.md)，现场依赖与程序随用户授权的Release附件保存。后文旧试验数值是对应时段的记录。
+2026-10-17当前参数：Aimer延迟330ms、旋转门限0.6°、20m/s、P轴固定微调0°、高/低电平保持100/50ms、ROI和角点细化开启；高速相位分支关闭。与10月11日基准的完整差异见根目录README。已有恢复资料仅对应历史发布，本次只保存小电脑源码和配置。
 核对日期：2026-10-11，包含当日下午的参数试验。今日证据和后续方案见[工作日志](../步兵自瞄工作日志.md)，主控操作见[步兵构建、烧录与调试](../firmware/infantry/README.md)。
 
 ## 1. 开发与运行位置
@@ -134,19 +134,19 @@ Aimer按值接收Target、用副本迭代，未来预测不会写回Tracker当�
 | vehicle/中速 | 未来水平0.5°门限、连续2个合格帧；没有保证误差恰好为0 |
 | high_speed_phase/高速 | 相位事件、时间窗口、未来板及信任条件 |
 | 最终输出 | 中心跟随/直接测量、−1.3°水平零位、最终yaw限速30°/s等 |
-| XucSender | 请求被接受后shoot=1约450ms，并保持该次yaw/pitch；首次成功shoot=0后低550ms，再重新判定 |
+| XucSender | 请求被接受后shoot=1约100ms，并保持该次yaw/pitch；首次成功shoot=0后低50ms，再重新判定 |
 | 实际主控 | 按车上固件执行，当前版本未知；一请求是否一发须验证 |
 
-450ms是信号保持长度，不是“等450ms才发”，也不是实测延迟。控制失效可能提前结束高电平。450+550ms不能直接叫固定1Hz或真实发弹间隔。源码还有450/200ms等旧注释，当前正式配置是450/550ms。
+100ms是高电平信号保持长度，不是“等100ms才发”，也不是实测延迟。控制失效可能提前结束高电平。100+50ms是软件保持与释放时间，不能直接当作真实发弹间隔。源码还有450/200ms等旧注释，当前正式配置是100/50ms。
 
 USART6、460800、SP包头、CRC16，角度rad：
 
 | 方向 | 长度 | 字段顺序 |
 |---|---:|---|
 | 上→下 | 14B | head[2], control(u8), shoot(u8), yaw(float32), pitch(float32), crc16 |
-| 下→上 | 20B | head[2], mode(u8), robot_id(u8), bullet_speed(float32), bullet_count(u16), imu_pitch(float32), imu_yaw(float32), crc16 |
+| 下→上 | 30B | head[2], mode(u8), robot_id(u8), bullet_speed(float32), bullet_count(u16), imu_pitch(float32), imu_yaw(float32), fire_flag(u16), fire_tick(u32), friction_current(i16), supply_speed(i16), crc16 |
 
-`io/xuc.hpp`的Rx/Tx命名沿用下位机视角，优先确认方向。当前仓库固件复用bullet_speed为拨弹RPM、bullet_count为摩擦轮RPM打包、robot_id为门控位；车上不一定相同，不能按名字解作弹速/发数。
+`io/xuc.hpp`的Rx/Tx命名沿用下位机视角，优先确认方向。2026-10-13按用户提供的`omni-code-main/RCS_code/STM32F405/xuc.h/.cpp`和线上30字节CRC包适配：bullet_speed来自裁判系统，bullet_count是回传包序号；fire_tick是1kHz FreeRTOS tick；friction_current为can2_motor[0]的原始电流反馈，尚未换算安培；supply_speed是can2_motor[2]转子RPM。fire_flag来自两摩擦轮电流绝对值和超过3000的判定，不能当作已标定的出膛时刻。`firmware/infantry`保留的另一实现不用于解释这份线上协议，也不互相覆盖或烧录。
 
 速度链仍有潜在不一致：standard接受反馈5–40，Aimer接受5–35、无效回退23；直接俯仰和事件用配置28。新查四轮请求的反馈字段均为0，全部选用配置28，未见这些请求间来源切换；28仍不是实测速度。统一入口前需确认字段语义与新鲜度。
 

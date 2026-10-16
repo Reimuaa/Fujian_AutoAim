@@ -48,6 +48,55 @@ using namespace std::chrono;
 
 namespace
 {
+// Observation history only: never stores a pending fire request. The sender's
+// hold/rearm cycle must not interrupt consecutive prediction qualification.
+struct RotationFireWindow
+{
+  int frames = 0;
+  int target_name = -1, target_type = -1, armor_count = 0, face_id = -1;
+  bool event_face = false;
+  double phase_rad = NAN, error_rad = NAN, next_error_rad = NAN;
+  std::chrono::steady_clock::time_point timestamp{};
+  bool two_frames_ready = false, current_frame_is_better = false;
+
+  void update(
+    bool valid, bool rebuilt, int name, int type, int count, int face,
+    bool uses_event_face, double phase, double error,
+    std::chrono::steady_clock::time_point time, int required_frames,
+    double max_phase_step, double tolerance)
+  {
+    two_frames_ready = false;
+    current_frame_is_better = false;
+    next_error_rad = NAN;
+    if (!valid || face < 0 || !std::isfinite(phase) || !std::isfinite(error)) {
+      frames = 0;
+      return;
+    }
+    const bool continuous = frames > 0 && !rebuilt && time > timestamp &&
+      name == target_name && type == target_type && count == armor_count &&
+      face == face_id && uses_event_face == event_face &&
+      std::abs(std::remainder(phase - phase_rad, 2.0 * M_PI)) <= max_phase_step;
+    const int needed = std::max(2, required_frames);
+    frames = continuous ? std::min(frames + 1, needed) : 1;
+    if (continuous) {
+      // One observed frame step forward; no future sample or fitted model.
+      next_error_rad = std::remainder(
+        error + std::remainder(error - error_rad, 2.0 * M_PI), 2.0 * M_PI);
+      current_frame_is_better = std::abs(error) <= std::abs(next_error_rad) ||
+        std::abs(next_error_rad) > tolerance;
+    }
+    two_frames_ready = frames >= needed;
+    target_name = name;
+    target_type = type;
+    armor_count = count;
+    face_id = face;
+    event_face = uses_event_face;
+    phase_rad = phase;
+    error_rad = error;
+    timestamp = time;
+  }
+};
+
 // Allocated once only when the complete debug path is enabled. These are
 // observations of existing calculations, never another prediction or gate.
 struct ShotPredictionDebug
@@ -766,6 +815,13 @@ int main(int argc, char * argv[])
   auto_aim::YOLO detector(config_path, false);  // 启用调试，显示检测窗口
   auto_aim::Solver solver(config_path);
   auto_aim::Tracker tracker(config_path, solver);
+  const bool roi_reacquisition_enabled =
+    integration_yaml["use_roi"].as<bool>() &&
+    integration_yaml["yolo_name"].as<std::string>() == "yolo26";
+  const cv::Rect configured_detection_roi(
+    integration_yaml["roi"]["x"].as<int>(), integration_yaml["roi"]["y"].as<int>(),
+    integration_yaml["roi"]["width"].as<int>(), integration_yaml["roi"]["height"].as<int>());
+  bool full_frame_search = true;
   auto_aim::Aimer aimer(config_path);
   auto_aim::ShotDelayAdapter shot_delay_adapter(shot_delay_config);
   auto_aim::Shooter shooter(config_path);
@@ -800,6 +856,9 @@ int main(int argc, char * argv[])
   auto_aim::RotationModelManager::Config rotation_model_config;
   rotation_model_config.vehicle_enter_rad_s = xuc_vehicle_model_enter_rad_s;
   rotation_model_config.vehicle_exit_rad_s = xuc_vehicle_model_exit_rad_s;
+  rotation_model_config.high_speed_phase_enabled =
+    integration_yaml["xuc_high_speed_phase_enabled"]
+      ? integration_yaml["xuc_high_speed_phase_enabled"].as<bool>() : true;
   rotation_model_config.high_speed_enter_rad_s = xuc_high_speed_enter_rad_s;
   rotation_model_config.high_speed_exit_rad_s = xuc_high_speed_exit_rad_s;
   rotation_model_config.mode_dwell_s = xuc_rotation_mode_dwell_s;
@@ -877,9 +936,9 @@ int main(int argc, char * argv[])
   std::chrono::steady_clock::time_point direct_pitch_last_update;
   std::chrono::steady_clock::time_point direct_pitch_last_measurement;
   bool xuc_fire_candidate_active = false;
+  RotationFireWindow rotation_fire_window;
   bool xuc_fire_ready_logged = false;
   int xuc_fire_candidate_frames = 0;
-  double xuc_fire_candidate_face_yaw_rad = INFINITY;
   std::chrono::steady_clock::time_point xuc_fire_candidate_since;
   bool xuc_one_face_armed = true;
   bool xuc_gyro_center_follow_logged = false;
@@ -1123,7 +1182,8 @@ int main(int argc, char * argv[])
     auto t1 = std::chrono::steady_clock::now();  // 🔍 性能监控
     // YOLO26 color memory is measured in frames. Pass a real increasing frame
     // index; the implicit -1 previously kept stale color memories forever.
-    auto armors = detector.detect(img, camera_frame_count);
+    const bool full_frame_search_used = roi_reacquisition_enabled && full_frame_search;
+    auto armors = detector.detect(img, camera_frame_count, full_frame_search_used);
     const auto detection_diagnostics = infantry_diagnostics_enabled
       ? detector.diagnostics() : auto_aim::YoloDetectionDiagnostics{};
     const std::size_t armors_before_color = armors.size();
@@ -1207,6 +1267,22 @@ int main(int argc, char * argv[])
     Eigen::Vector3d ypr = tools::eulers(solver.R_gimbal2world(), 2, 1, 0);
 
     auto targets = tracker.track(armors, t);
+    if (roi_reacquisition_enabled) {
+      if (tracker.state() == "tracking") {
+        const auto * observation = tracker.primary_observation();
+        const cv::Rect2f tracking_roi(
+          configured_detection_roi.x, configured_detection_roi.y,
+          configured_detection_roi.width == -1 ? img.cols : configured_detection_roi.width,
+          configured_detection_roi.height == -1 ? img.rows : configured_detection_roi.height);
+        full_frame_search = !(observation != nullptr && observation->points.size() == 4 &&
+          std::all_of(observation->points.begin(), observation->points.end(),
+            [&](const auto & point) { return tracking_roi.contains(point); }));
+      } else if (tracker.state() != "temp_lost" || tracker.temp_lost_count() >= 3) {
+        full_frame_search = true;
+      }
+      // One/two missed associations retain the current search region. A third
+      // miss enables full-frame detection on the next image, without resetting Tracker.
+    }
     const std::size_t armors_after_color = armors.size();
     auto t3 = std::chrono::steady_clock::now();
 
@@ -1281,7 +1357,12 @@ int main(int argc, char * argv[])
         auto_aim::RotationModelManager::name(rotation_model.mode),
         gyro_omega_rad_s);
     }
+    if (tracker.frame_diagnostics().initialized_this_frame) {
+      xuc_gyro_center_memory_valid = false;
+      direct_yaw_control_confirmed = false;
+    }
     vehicle_model_fresh = xuc_gyro_center_follow_enabled &&
+      tracker.primary_observation() != nullptr &&
       rotation_model.tracker_trusted &&
       rotation_model.mode != auto_aim::RotationModelManager::Mode::armor;
     gyro_model_fresh = vehicle_model_fresh &&
@@ -1302,9 +1383,8 @@ int main(int argc, char * argv[])
       const double center_age_s =
         std::chrono::duration<double>(t - xuc_gyro_center_last_fresh).count();
       if (center_age_s <= xuc_gyro_center_hold_s) {
-        // A tracker reset must not make the gimbal chase whichever plate is
-        // visible for one frame. Hold the last validated vehicle center, but
-        // keep gyro_model_fresh=false so the fire gate remains closed.
+        // Keep the last observed centre through a short association gap.
+        // Prediction-only frames do not renew this memory or permit firing.
         gyro_center_follow_active = true;
         gyro_center_yaw = xuc_gyro_center_memory_yaw;
       } else {
@@ -1448,13 +1528,15 @@ int main(int argc, char * argv[])
       shot_prediction_debug->aimer_begin_ns = duration_cast<nanoseconds>(
         steady_clock::now().time_since_epoch()).count();
     }
+    // Selected-face identity is needed by the fire gate even with debug off.
+    auto_aim::AimPredictionTrace native_fire_prediction;
     auto command = aimer.aim(
       targets, t, cboard.bullet_speed, true,
-      infantry_diagnostics_enabled && shot_prediction_debug
-        ? &shot_prediction_debug->native : nullptr,
+      &native_fire_prediction,
       vehicle_model_fresh && !gyro_model_fresh
         ? auto_aim::AimGeometry::whole_ekf : auto_aim::AimGeometry::existing);
     if (infantry_diagnostics_enabled && shot_prediction_debug) {
+      shot_prediction_debug->native = native_fire_prediction;
       shot_prediction_debug->aimer_end_ns = duration_cast<nanoseconds>(
         steady_clock::now().time_since_epoch()).count();
     }
@@ -1508,7 +1590,8 @@ int main(int argc, char * argv[])
         measured_yaw = gyro_center_follow_active
           ? gyro_center_yaw
           : std::atan2(measured_armor.xyz_in_world.y(), measured_armor.xyz_in_world.x());
-        valid_measurement = std::isfinite(measured_yaw);
+        valid_measurement = std::isfinite(measured_yaw) &&
+          (!gyro_center_follow_active || vehicle_model_fresh);
         if (valid_measurement) direct_yaw_measurement_rad = measured_yaw;
         if (valid_measurement && direct_yaw_focal_x_px > 0.0 && !img.empty()) {
           double center_x_px = measured_armor.center.x;
@@ -1594,16 +1677,16 @@ int main(int argc, char * argv[])
       } else if (direct_yaw_initialized) {
         const double visual_gap =
           std::chrono::duration<double>(t - direct_yaw_last_measurement).count();
-        if (visual_gap <= direct_yaw_hold_s) {
-          // During a short detector gap, allow only the already-bounded native
-          // prediction.  This keeps fast motion continuous without trusting an
-          // unconstrained EKF state.
+        if (direct_yaw_control_confirmed && visual_gap <= direct_yaw_hold_s) {
+          // Hold the centre through a short association gap. Other targets
+          // retain the existing bounded prediction.
           command.control = true;
           command.shoot = false;
           command.yaw = std::remainder(
             direct_yaw_filtered + direct_yaw_command_correction_rad,
             2.0 * M_PI);
-          if (prediction_lead_limit_configured && native_prediction_trusted) {
+          if (!gyro_center_follow_active &&
+              prediction_lead_limit_configured && native_prediction_trusted) {
             const double prediction_delta =
               std::remainder(native_predicted_yaw - direct_yaw_filtered, 2.0 * M_PI);
             command.yaw = std::remainder(
@@ -1860,7 +1943,7 @@ int main(int argc, char * argv[])
         }
       } else if (xuc_gyro_cadence_hold_logged) {
         tools::logger()->info(
-          "[XUC][FIRE] command rearmed; fresh qualification required");
+          "[XUC][FIRE] command rearmed; evaluating current frame");
         xuc_gyro_cadence_hold_logged = false;
       }
       if (predictive_fire_active && native_prediction_valid) {
@@ -2172,62 +2255,72 @@ int main(int argc, char * argv[])
           direct_yaw_pixel_error_rad * 180.0 / M_PI,
           direct_pitch_pixel_error_rad * 180.0 / M_PI);
       }
-      if (fire_candidate) {
-        const double candidate_face_yaw_rad = gyro_event_face_valid
+      const auto & fire_tracker_frame = tracker.frame_diagnostics();
+      const bool prediction_observation_valid = predictive_fire_active &&
+        !targets.empty() && tracker.state() == "tracking" &&
+        tracker.primary_observation() != nullptr && convergence_gate_open &&
+        direct_yaw_measurement_fresh && direct_pitch_measurement_fresh &&
+        (!xuc.enabled() || xuc_imu_sync_valid) &&
+        native_prediction_valid && native_fire_prediction.valid &&
+        gyro_predicted_impact_yaw_valid && aimer.debug_aim_point.valid;
+      rotation_fire_window.update(
+        prediction_observation_valid,
+        fire_tracker_frame.initialized_this_frame || fire_tracker_frame.nis_reset ||
+          fire_tracker_frame.diverged,
+        targets.empty() ? -1 : static_cast<int>(targets.front().name),
+        targets.empty() ? -1 : static_cast<int>(targets.front().armor_type),
+        targets.empty() ? 0 : targets.front().armor_num(),
+        native_fire_prediction.face_id,
+        gyro_event_face_valid,
+        !prediction_observation_valid ? NAN : (gyro_event_face_valid
           ? static_cast<double>(gyro_event_face_id) * M_PI / 2.0
-          : aimer.debug_aim_point.xyza[3];
-        if (predictive_fire_active && xuc_fire_candidate_active &&
-            std::isfinite(xuc_fire_candidate_face_yaw_rad) &&
-            std::isfinite(candidate_face_yaw_rad)) {
-          const double phase_step_rad = std::abs(std::remainder(
-            candidate_face_yaw_rad - xuc_fire_candidate_face_yaw_rad,
-            2.0 * M_PI));
-          if (phase_step_rad > xuc_gyro_candidate_max_phase_step_rad) {
-            tools::logger()->info(
-              "[XUC][FIRE] candidate face switched by {:.1f} deg; restarting window",
-              phase_step_rad * 180.0 / M_PI);
-            xuc_fire_candidate_active = false;
-            xuc_fire_ready_logged = false;
-            xuc_fire_candidate_frames = 0;
+          : aimer.debug_aim_point.xyza[3]),
+        gyro_predicted_impact_yaw_error_rad, t, xuc_gyro_fire_min_consecutive_frames,
+        xuc_gyro_candidate_max_phase_step_rad, xuc_gyro_predicted_yaw_tolerance_rad);
+      if (predictive_fire_active) {
+        // The current gates and cadence apply only to this frame's request.
+        // Qualification above keeps observing outside the angle window and
+        // during the sender's hold/rearm interval. It never latches a request.
+        stable_window_open = rotation_fire_window.two_frames_ready;
+        command.shoot = stable_window_open && fire_candidate &&
+          gyro_yaw_gate_native_open && rotation_fire_window.current_frame_is_better;
+        // Keep the stationary branch's dwell state separate from rotation.
+        xuc_fire_candidate_active = false;
+        xuc_fire_ready_logged = false;
+        xuc_fire_candidate_frames = 0;
+        if (command.shoot) {
+          tools::logger()->info(
+            "[XUC][FIRE] rotation qualified frames={} face={} "
+            "predicted_impact_yaw_error_deg={:.2f} next_error_deg={:.2f}",
+            rotation_fire_window.frames, rotation_fire_window.face_id,
+            gyro_predicted_impact_yaw_error_rad * 180.0 / M_PI,
+            rotation_fire_window.next_error_rad * 180.0 / M_PI);
+          if (one_face_policy_active) {
+            xuc_one_face_armed = false;
+            if (gyro_event_schedule_valid) event_last_fired_cycle = gyro_event_hit_cycle;
           }
         }
+      } else if (fire_candidate) {
         if (!xuc_fire_candidate_active) {
           xuc_fire_candidate_active = true;
           xuc_fire_ready_logged = false;
           xuc_fire_candidate_frames = 1;
           xuc_fire_candidate_since = t;
-          xuc_fire_candidate_face_yaw_rad = candidate_face_yaw_rad;
           tools::logger()->info("[XUC][FIRE] stable-window candidate started");
         } else {
           ++xuc_fire_candidate_frames;
-          xuc_fire_candidate_face_yaw_rad = candidate_face_yaw_rad;
         }
         const double stable_time =
           std::chrono::duration<double>(t - xuc_fire_candidate_since).count();
-        if (predictive_fire_active) {
-          // Predictive fire emits a one-frame request. XucSender turns an accepted
-          // request into the lower board's 450 ms high / 200 ms low single-shot
-          // sequence. The command rearm window paces repeated qualification.
-          // Event mode: the dynamic-lead gate is a short time window (~1 frame
-          // at high omega), so a single qualifying frame is sufficient to fire.
-          // Native fallback (no event omega/tracker) keeps the 2-frame rule.
-          const int ev_need_frames = gyro_event_schedule_valid
-            ? 1
-            : xuc_gyro_fire_min_consecutive_frames;
-          stable_window_open = xuc_fire_candidate_frames >= ev_need_frames;
-          command.shoot =
-            stable_window_open && !xuc_fire_ready_logged;
-        } else {
-          const double required_stable_s = one_face_policy_active
-            ? xuc_gyro_fire_stable_s
-            : xuc_fire_stable_s;
-          stable_window_open = stable_time >= required_stable_s;
-          // XUC also receives a one-frame request for stationary targets. Once
-          // the command rearm window closes this shot, a still-valid gate starts
-          // a new qualification without flooding the serial link with requests.
-          command.shoot = stable_window_open &&
-            (!xuc.enabled() || !xuc_fire_ready_logged);
-        }
+        const double required_stable_s = one_face_policy_active
+          ? xuc_gyro_fire_stable_s
+          : xuc_fire_stable_s;
+        stable_window_open = stable_time >= required_stable_s;
+        // XUC also receives a one-frame request for stationary targets. Once
+        // the command rearm window closes this shot, a still-valid gate starts
+        // a new qualification without flooding the serial link with requests.
+        command.shoot = stable_window_open &&
+          (!xuc.enabled() || !xuc_fire_ready_logged);
         if (command.shoot && !xuc_fire_ready_logged) {
           tools::logger()->info(
             "[XUC][FIRE] qualified after {:.0f} ms/{} frames, "
@@ -2260,7 +2353,6 @@ int main(int argc, char * argv[])
         xuc_fire_candidate_active = false;
         xuc_fire_ready_logged = false;
         xuc_fire_candidate_frames = 0;
-        xuc_fire_candidate_face_yaw_rad = INFINITY;
         command.shoot = false;
       }
       if (infantry_diagnostics_enabled) {
@@ -2772,7 +2864,7 @@ int main(int argc, char * argv[])
           shot_tx_ok ? xuc.last_tx_complete_ns() : 0,
           shot_tx_ok ? xuc.last_tx_yaw_raw() * 180.0 / M_PI : NAN,
           shot_tx_ok ? xuc.last_tx_pitch_raw() * 180.0 / M_PI : NAN,
-          xuc.bullet_speed(), xuc_pending_feeder_turns_at_request);
+          xuc.feeder_speed_rpm(), xuc_pending_feeder_turns_at_request);
         const int64_t tx_ns = xuc.last_shoot_tx_ns();
         if (shot_tx_ok && tx_ns > 0) {
           xuc_pending_shot_time = std::chrono::steady_clock::time_point(
@@ -2794,6 +2886,25 @@ int main(int argc, char * argv[])
         const auto & debug = *shot_prediction_debug;
         const auto & native = debug.native;
         auto & session = *prediction_session_debug;
+        const auto shooter_feedback = xuc.take_shooter_feedback();
+        if (!shooter_feedback.empty()) {
+          nlohmann::json samples = nlohmann::json::array();
+          for (const auto & sample : shooter_feedback) {
+            samples.push_back({{"host_rx_ns", sample.host_rx_ns},
+              {"feedback_sequence", sample.feedback_sequence},
+              {"fire_flag", sample.fire_flag}, {"fire_tick_ms", sample.fire_tick_ms},
+              {"friction_current_raw", sample.friction_current_raw},
+              {"feeder_speed_rpm", sample.feeder_speed_rpm}});
+          }
+          xuc.record_shot_debug({{"kind", "shooter_feedback"}, {"run", diagnostics_run_id},
+            {"frame_seq", camera_frame_count}, {"samples", std::move(samples)},
+            {"samples_dropped_total", xuc.shooter_feedback_dropped()},
+            {"host_timestamp_basis", "host_steady_clock_parse"},
+            {"lower_timestamp_basis", "freertos_tick_1khz"},
+            {"fire_flag_basis", "lower_current_threshold"},
+            {"friction_current_units", "raw_can_feedback"},
+            {"feeder_speed_units", "motor_rotor_rpm"}, {"projectile_exit", "unknown"}});
+        }
         const auto & td = tracker.frame_diagnostics();
         const bool has_target = !targets.empty();
         const int name = has_target ? static_cast<int>(targets.front().name) : -1;
@@ -2852,6 +2963,11 @@ int main(int argc, char * argv[])
           {"fire_branch", gyro_event_schedule_valid ? "high_speed_event" : debug.gate_branch},
           {"request_id", issued_shot_id}, {"request_shoot", command.shoot},
           {"gate_error_rad", number(gyro_predicted_impact_yaw_error_rad)},
+          {"rotation_fire_window", {
+            {"frames", rotation_fire_window.frames},
+            {"two_frames_ready", rotation_fire_window.two_frames_ready},
+            {"current_frame_is_better", rotation_fire_window.current_frame_is_better},
+            {"next_error_rad", number(rotation_fire_window.next_error_rad)}}},
           {"gate_tolerance_rad", xuc_gyro_predicted_yaw_tolerance_rad},
           {"gate_reference_yaw_rad", number(ypr[0])},
           {"native_yaw_rad", number(native_predicted_yaw)},
@@ -3182,6 +3298,8 @@ int main(int argc, char * argv[])
         trace["armors"] = armors_after_color;
         trace["targets"] = targets.size();
         trace["tracker_state"] = tracker.state();
+        trace["full_frame_search"] = full_frame_search_used;
+        trace["temp_lost_count"] = tracker.state() == "temp_lost" ? tracker.temp_lost_count() : 0;
         trace["associations"] = tracker.last_associations().size();
         trace["primary_detection"] = tracker.primary_detection_index();
         trace["primary_face"] = tracker.primary_face_id();
@@ -3370,7 +3488,8 @@ int main(int argc, char * argv[])
         trace["shoot_hold_continuation"] = tx_ok && xuc.last_tx_shoot() == 1 &&
           !command.shoot;
         trace["feeder_feedback_raw"] = xuc.enabled()
-          ? finite_value(xuc.bullet_speed()) : nlohmann::json(nullptr);
+          ? finite_value(xuc.feeder_speed_rpm()) : nlohmann::json(nullptr);
+        trace["feeder_feedback_units"] = "motor_rotor_rpm";
         trace["feeder_motor_turns_est"] = xuc.enabled()
           ? finite_value(xuc.feeder_motor_turns_estimate()) : nlohmann::json(nullptr);
         trace["pending_shot_id"] = xuc_pending_shot

@@ -48,6 +48,16 @@ struct XucShotDebugContext
   int64_t frame_ns = 0;
 };
 
+struct XucShooterFeedback
+{
+  int64_t host_rx_ns;
+  uint16_t feedback_sequence;
+  uint16_t fire_flag;
+  uint32_t fire_tick_ms;
+  int16_t friction_current_raw;
+  int16_t feeder_speed_rpm;
+};
+
 // XUC 上位机→下位机：与新版下位机 RxPacket_TJ 完全一致（14 字节）
 #pragma pack(push, 1)
 struct XucRxPacket
@@ -63,7 +73,7 @@ struct XucRxPacket
 static_assert(sizeof(XucRxPacket) == 14, "XucRxPacket must be 14 bytes");
 static_assert(offsetof(XucRxPacket, crc16) == 12, "XucRxPacket CRC offset must be 12");
 
-// XUC 下位机→上位机：与新版下位机 TxPacket_TJ 完全一致（20 字节）
+// XUC 下位机→上位机：与当前 omni-code TxPacket_TJ 一致（30 字节）。
 #pragma pack(push, 1)
 struct XucTxPacket
 {
@@ -74,11 +84,19 @@ struct XucTxPacket
   uint16_t bullet_count;  // omni-code当前实现为回传包递增序号
   float imu_pitch;        // IMU 俯仰角 (rad)
   float imu_yaw;          // IMU 航向角 (rad)
+  uint16_t fire_flag;     // 下位机电流阈值检测状态，不是已验证的出膛事件
+  uint32_t fire_tick_ms;  // 下位机最近检测事件的 FreeRTOS tick（1 kHz）
+  int16_t friction_current_raw;  // can2_motor[0] 的原始电流反馈，未换算安培
+  int16_t feeder_speed_rpm;      // can2_motor[2] 电机转子 RPM
   uint16_t crc16;         // CRC16（低字节在前）
 };
 #pragma pack(pop)
-static_assert(sizeof(XucTxPacket) == 20, "XucTxPacket must be 20 bytes");
-static_assert(offsetof(XucTxPacket, crc16) == 18, "XucTxPacket CRC offset must be 18");
+static_assert(sizeof(XucTxPacket) == 30, "XucTxPacket must be 30 bytes");
+static_assert(offsetof(XucTxPacket, fire_flag) == 18, "XucTxPacket fire flag offset must be 18");
+static_assert(offsetof(XucTxPacket, fire_tick_ms) == 20, "XucTxPacket fire tick offset must be 20");
+static_assert(offsetof(XucTxPacket, friction_current_raw) == 24, "XucTxPacket current offset must be 24");
+static_assert(offsetof(XucTxPacket, feeder_speed_rpm) == 26, "XucTxPacket feeder RPM offset must be 26");
+static_assert(offsetof(XucTxPacket, crc16) == 28, "XucTxPacket CRC offset must be 28");
 
 // 向下位机发送目标角；接收 mode/robot_id/弹速/回传序号/IMU。
 class XucSender
@@ -156,13 +174,23 @@ public:
   {
     return static_cast<double>(bullet_speed_.load(std::memory_order_relaxed));
   }
-  // Diagnostic only: integrate the feedback float as M2006 rotor RPM when it
-  // has RPM-like magnitude. The installed firmware still needs verification.
+  double feeder_speed_rpm() const
+  {
+    return static_cast<double>(feeder_speed_rpm_.load(std::memory_order_relaxed));
+  }
+  // Diagnostic only: integrate the explicit feeder rotor RPM field.
   double feeder_motor_turns_estimate() const
   {
     return feeder_motor_turns_estimate_.load(std::memory_order_relaxed);
   }
   uint16_t bullet_count() const { return bullet_count_.load(std::memory_order_relaxed); }
+  // Drain on the sending thread so ShotDebug retains its single producer.
+  // Capture is disabled in compact mode; at most 256 pending samples are kept.
+  std::vector<XucShooterFeedback> take_shooter_feedback();
+  uint64_t shooter_feedback_dropped() const
+  {
+    return shooter_feedback_dropped_.load(std::memory_order_relaxed);
+  }
   int64_t last_shoot_tx_ns() const
   {
     return last_shoot_tx_ns_.load(std::memory_order_acquire);
@@ -263,11 +291,14 @@ private:
   std::atomic<uint8_t> mode_{0};
   std::atomic<uint8_t> robot_id_{0};
   std::atomic<float> bullet_speed_{0.0f};
+  std::atomic<int16_t> feeder_speed_rpm_{0};
   std::atomic<uint16_t> bullet_count_{0};
   std::atomic<float> imu_pitch_{0.0f};
   std::atomic<float> imu_yaw_{0.0f};
   mutable std::mutex imu_history_mutex_;
   std::deque<XucTimedImu> imu_history_;
+  std::vector<XucShooterFeedback> shooter_feedback_;
+  std::atomic<uint64_t> shooter_feedback_dropped_{0};
   std::atomic<int64_t> last_shoot_tx_ns_{0};
   std::atomic<uint64_t> rx_bytes_{0};
   std::atomic<uint64_t> header_candidates_{0};

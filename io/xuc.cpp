@@ -553,7 +553,16 @@ void XucSender::send(const Command & cmd)
   }
 }
 
-// 接收线程：读串口字节 → 扫描 'S''P' + CRC16 校验 → 解析 TxPacket_TJ（20 字节）
+std::vector<XucShooterFeedback> XucSender::take_shooter_feedback()
+{
+  if (!feeder_diagnostics_enabled_) return {};
+  std::lock_guard<std::mutex> lock(imu_history_mutex_);
+  std::vector<XucShooterFeedback> samples(shooter_feedback_.begin(), shooter_feedback_.end());
+  shooter_feedback_.clear();
+  return samples;
+}
+
+// 接收线程：读串口字节 → 扫描 'S''P' + CRC16 校验 → 解析 TxPacket_TJ（30 字节）
 void XucSender::recv_loop()
 {
   uint8_t scratch[64];
@@ -593,10 +602,7 @@ void XucSender::recv_loop()
             const auto received_at = std::chrono::steady_clock::now();
             const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
               received_at.time_since_epoch()).count();
-            // This field is M2006 rotor RPM in the repository's infantry
-            // firmware. A referee projectile-speed field would be below this
-            // RPM-like range and must never be counted as feeder motion.
-            const double feeder_rpm = static_cast<double>(pkt.bullet_speed);
+            const double feeder_rpm = static_cast<double>(pkt.feeder_speed_rpm);
             if (feeder_diagnostics_enabled_ && previous_feedback_ns > 0 &&
                 std::abs(previous_feeder_rpm) <= 3000.0 &&
                 std::abs(feeder_rpm) <= 3000.0 &&
@@ -631,10 +637,19 @@ void XucSender::recv_loop()
                   imu_history_.pop_front();
                 }
               }
+              if (feeder_diagnostics_enabled_) {
+                if (shooter_feedback_.size() == 256) {
+                  shooter_feedback_.erase(shooter_feedback_.begin());
+                  shooter_feedback_dropped_.fetch_add(1, std::memory_order_relaxed);
+                }
+                shooter_feedback_.push_back({now_ns, pkt.bullet_count, pkt.fire_flag,
+                  pkt.fire_tick_ms, pkt.friction_current_raw, pkt.feeder_speed_rpm});
+              }
             }
             mode_.store(pkt.mode, std::memory_order_relaxed);
             robot_id_.store(pkt.robot_id, std::memory_order_relaxed);
             bullet_speed_.store(pkt.bullet_speed, std::memory_order_relaxed);
+            feeder_speed_rpm_.store(pkt.feeder_speed_rpm, std::memory_order_relaxed);
             bullet_count_.store(pkt.bullet_count, std::memory_order_relaxed);
             imu_pitch_.store(pkt.imu_pitch, std::memory_order_relaxed);
             imu_yaw_.store(pkt.imu_yaw, std::memory_order_relaxed);

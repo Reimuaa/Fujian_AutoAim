@@ -2,11 +2,13 @@
 
 正式运行配置为configs/standard.yaml，标定工具配置为configs/calibration.yaml。启动器生成的logs/xuc-bringup/field_autoaim.runtime.yaml是缓存；不要将它作为另一份配置源。颜色选择保存在~/.config/sp-vision/field_autoaim_enemy_color。
 
-## 2026-10-11晚间步兵发布参数
 
-当前步兵以`configs/standard.yaml`的实际数值为准：Aimer高/低速延迟均为0.325s、旋转预测水平门限0.5°、配置弹速20m/s、弹道P轴微调-0.50°。ROI开启，区域x=420、y=300、600×600；YOLO26角点细化开启。`debug`、`detector_debug`和`infantry_diagnostics_enabled`均关闭，云台控制及开火权限开启。独立高速事件延迟`xuc_event_fire_delay_s`仍为0.085s，高/低电平保持450/550ms，额外重装填间隔0ms。
+## 2026-10-17步兵当前配置
 
-P轴微调通过减少向上的弹道补偿生效，并受补偿下限0°约束；不是所有距离恒定降低8cm。旧注释中的3.2m/8cm对应之前-1.40°的试验背景。配置中的`pitch_offset: 6`是另一条原有参数，未在本轮更改。完整依赖与恢复方法见[快速恢复](recovery.md)。以下哨兵标定记录属于另一硬件目标，不能覆盖当前步兵参数。
+当前步兵以`configs/standard.yaml`实际数值为准：Aimer高/低速延迟均为0.330s、旋转预测水平门限0.6°、配置弹速20m/s、弹道P轴固定微调已取消（0°）。ROI开启，区域x=420、y=300、600×600；YOLO26角点细化开启。`debug`和`detector_debug`关闭，`infantry_diagnostics_enabled`开启，云台控制及开火权限开启。`xuc_high_speed_phase_enabled: false`，所有旋转速度采用现有vehicle中速分支；独立事件延迟0.085s参数保留，不与330ms直接相加。高/低电平保持100/50ms，额外重装填间隔0ms。
+
+固定P轴微调已取消，`xuc_ballistic_pitch_trim_deg: 0.0`；原有弹道补偿继续生效。旧注释中的3.2m/8cm对应之前-1.40°的试验背景。配置中的`pitch_offset: 6`是另一条原有参数，未在本轮更改。完整依赖与恢复方法见[快速恢复](recovery.md)。以下哨兵标定记录属于另一硬件目标，不能覆盖当前步兵参数。
+
 
 ## 内参：已完成
 
@@ -47,7 +49,11 @@ P轴微调通过减少向上的弹道补偿生效，并受补偿下限0°约束�
 
 `planned_send_ns` 是事件分支计划发送时刻；`packet_prepare_ns` 是发送函数准备包时的主机时间，不能当精确的串口写入开始。`tx_write_complete_ns` 是完整写入调用返回时刻，`first_low` 的该时刻同时是软件低电平区间起点。精确写入开始、真实曝光中心、离膛、实际发数仍保留 `null`/`unknown`。Aimer 的实际迭代时刻和飞行时间现由只读 trace 暴露，定义见下文。快照分别记录 Aimer 输入/有效速度、直接俯仰和事件分支配置速度；反馈字段单位仍未证实，最新 RX 时间与速度不是原子配对，不能把它当已验证的弹速数据年龄。
 
-开启诊断后，`[FIRE_GATE_SUMMARY]` 每 5 秒累计各级门限作为首个阻断条件的帧数、时长和最长连续时长；逐帧摘要含完整门状态。`[SHOT_TX]` 用 shot_id 区分请求与串口写入成功，记录写入开始、写入返回的主机时间及实际打包角度；写入返回不代表下位机接收或子弹离膛。当前步兵固件按 8 弹位、M2006 36:1 计算，每推进一个弹位为输出轮 1/8 圈，即电机转子约 4.5 圈。上位机仅用现有回传字段的转速积分估算转角；`[SHOT_FEED_EST]` 记录首次估算跨过一个弹位的时间，逐帧摘要标为 `one_slot_rotation_est`。这不是编码器完成计数，更不能证明子弹实际出膛，`projectile_exit` 始终记为 `unknown`。该字段的 RPM 含义须按现场新烧录固件再次核实。
+开启诊断后，`[FIRE_GATE_SUMMARY]` 每 5 秒累计各级门限作为首个阻断条件的帧数、时长和最长连续时长；逐帧摘要含完整门状态。`[SHOT_TX]` 用 shot_id 区分请求与串口写入成功，记录写入开始、写入返回的主机时间及实际打包角度；写入返回不代表下位机接收或子弹离膛。`[SHOT_FEED_EST]` 用明确的拨弹电机转子RPM积分估算转角，保留历史4.5圈诊断阈值；该阈值基于旧8弹位、36:1假设，不能直接用于当前omni硬件的完成计数，须单独核实。`projectile_exit` 始终为 `unknown`。
+
+2026-10-13起按用户提供的omni-code回传协议解析30字节包。完整诊断新增`[SHOT_DEBUG] kind=shooter_feedback`，按相机帧批量输出期间收到的全部回传样本：`host_rx_ns`（主机解析时的steady-clock纳秒）、`feedback_sequence`（回传序号，不是发数）、`fire_flag`、`fire_tick_ms`（下位机1kHz FreeRTOS tick）、`friction_current_raw`（一路摩擦轮原始CAN电流反馈，未换算安培）、`feeder_speed_rpm`（拨弹电机转子RPM）。接收暂存最多256个样本，溢出计入`samples_dropped_total`；现有异步日志队列丢弃另见`queue_dropped_total`。简洁模式不采集这一波形、不积分转角、不构造或写入新增日志。
+
+下位机`fire_flag/fire_tick_ms`由两路摩擦轮电流绝对值和超过3000判定产生，并非经独立测速/光电验证的出膛事件；启动或加速也可能触发，不能直接拿它计算真实发射延迟。主机与下位机时钟尚未对齐，不直接相减。现有30字节包没有摩擦轮实时转速或拨弹编码器角度。
 
 ## 旋转目标中心过程噪声
 

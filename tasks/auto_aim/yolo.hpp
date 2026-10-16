@@ -30,6 +30,10 @@ class YOLOBase
 {
 public:
   virtual std::list<Armor> detect(const cv::Mat & img, int frame_count) = 0;
+  virtual std::list<Armor> detect(const cv::Mat & img, int frame_count, bool)
+  {
+    return detect(img, frame_count);
+  }
   virtual YoloDetectionDiagnostics diagnostics() const { return {}; }
 
   virtual std::list<Armor> postprocess(
@@ -41,7 +45,7 @@ class YOLO
 public:
   YOLO(const std::string & config_path, bool debug = true);
 
-  std::list<Armor> detect(const cv::Mat & img, int frame_count = -1);
+  std::list<Armor> detect(const cv::Mat & img, int frame_count = -1, bool full_frame = false);
   YoloDetectionDiagnostics diagnostics() const;
 
   std::list<Armor> postprocess(

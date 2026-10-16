@@ -94,6 +94,7 @@ public:
   Tracker(const std::string & config_path, Solver & solver);
 
   std::string state() const;
+  int temp_lost_count() const { return temp_lost_count_; }
   const std::vector<ArmorAssociation> & last_associations() const;
   int primary_detection_index() const;
   int primary_face_id() const;
