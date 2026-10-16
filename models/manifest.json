@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "snapshot_date": "2026-10-17",
+  "captured_at_utc": "2026-10-16T16:55:36.727479+00:00",
+  "source_root": "/home/rm/sp_vision",
+  "description": "User selected only the three active model files. No other models, logs, SDK libraries, executables, photos or videos uploaded. Live assets/config paths unchanged.",
+  "active_models": [
+    "models/detection/openvino/yolo26/yolo26.xml",
+    "models/detection/openvino/yolo26/yolo26.bin",
+    "models/classification/tiny_resnet.onnx"
+  ],
+  "files": [
+    {
+      "repository_path": "models/classification/tiny_resnet.onnx",
+      "source_paths": [
+        "assets/tiny_resnet.onnx"
+      ],
+      "bytes": 1105322,
+      "sha256": "9f45670da9e61f31b60c12efb08c8a7522ff56cc220c7fa9907283ce7e730179",
+      "git_blob": "1c2e6ec60e7c97e510885b2949a9fea101cc4f49"
+    },
+    {
+      "repository_path": "models/detection/openvino/yolo26/yolo26.bin",
+      "source_paths": [
+        "assets/yolo26.bin"
+      ],
+      "bytes": 2701140,
+      "sha256": "c9a1e72c61d095db2ad17fa2801871db21f029f701d131bb9feab1fb6ce1f118",
+      "git_blob": "e0e7168510c0617e0737ace5f56c843c6661044a"
+    },
+    {
+      "repository_path": "models/detection/openvino/yolo26/yolo26.xml",
+      "source_paths": [
+        "assets/yolo26.xml"
+      ],
+      "bytes": 870534,
+      "sha256": "356b1a3275fdf01f722a18a3dc81db218742546848e0698635f064106482e6dc",
+      "git_blob": "429c1868bce7e8c1166ee77ffdcac95e4f7d9338"
+    }
+  ],
+  "logs_uploaded": false,
+  "other_models_uploaded": false
+}

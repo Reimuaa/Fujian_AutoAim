@@ -10,4 +10,4 @@
 - 改目录或文件名必须同步更新启动器、桌面入口、服务、文档和构建路径。
 - 网络优先普通 HTTP/HTTPS；现场 SSH 使用用户已授权的连接，不改用插件、隧道或浏览器。
 
-- 仓库只跟踪源码、配置、构建脚本、文档及依赖清单。禁止提交固件镜像、可执行文件、SDK动态库、模型权重、日志或录像；提交前运行 `python3 scripts/check_source_tree.py`。
+- 仓库默认只跟踪源码、配置、构建脚本、文档及依赖清单。2026-10-17用户明确授权当前YOLO26的XML/BIN和tiny_resnet.onnx三个模型文件保存到 models/，只允许 models/manifest.json 逐项登记的文件；assets/ 仍作为本机运行目录忽略。日志上传已被用户取消。禁止提交固件镜像、可执行文件、SDK动态库、日志或录像；提交前运行 `python3 scripts/check_source_tree.py`。

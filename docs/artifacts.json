@@ -1,23 +1,26 @@
 {
-  "description": "Current external runtime dependencies only. Obtain SDK libraries from vendors and model files from the resource owner; Git history is not a resource source.",
+  "description": "Current external runtime paths. User-authorized model snapshots are tracked under models/ with original-path mappings in models/manifest.json; SDK libraries remain external.",
   "files": [
     {
       "path": "assets/tiny_resnet.onnx",
       "kind": "model",
       "size": 1105322,
-      "sha256": "9f45670da9e61f31b60c12efb08c8a7522ff56cc220c7fa9907283ce7e730179"
+      "sha256": "9f45670da9e61f31b60c12efb08c8a7522ff56cc220c7fa9907283ce7e730179",
+      "archive_path": "models/classification/tiny_resnet.onnx"
     },
     {
       "path": "assets/yolo26.bin",
       "kind": "model",
       "size": 2701140,
-      "sha256": "c9a1e72c61d095db2ad17fa2801871db21f029f701d131bb9feab1fb6ce1f118"
+      "sha256": "c9a1e72c61d095db2ad17fa2801871db21f029f701d131bb9feab1fb6ce1f118",
+      "archive_path": "models/detection/openvino/yolo26/yolo26.bin"
     },
     {
       "path": "assets/yolo26.xml",
       "kind": "model",
       "size": 870534,
-      "sha256": "356b1a3275fdf01f722a18a3dc81db218742546848e0698635f064106482e6dc"
+      "sha256": "356b1a3275fdf01f722a18a3dc81db218742546848e0698635f064106482e6dc",
+      "archive_path": "models/detection/openvino/yolo26/yolo26.xml"
     },
     {
       "path": "io/hikrobot/lib/amd64/libMvCameraControl.so",
@@ -43,5 +46,6 @@
       "size": 13442968,
       "sha256": "23a4a84fb9bcedd515c32b89c4c9dac7fb98230a09b3c6c14da99927a4d462be"
     }
-  ]
+  ],
+  "model_archive_manifest": "models/manifest.json"
 }

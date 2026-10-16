@@ -9,3 +9,8 @@
 io/driver/** -whitespace
 io/hikrobot/include/** -whitespace
 io/mindvision/include/** -whitespace
+
+# Preserve exact hashes for user-authorized model snapshots
+/models/** -text -diff
+/models/README.md text eol=lf diff
+/models/manifest.json text eol=lf diff

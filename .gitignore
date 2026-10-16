@@ -86,3 +86,7 @@ backups/
 .codex-backups/
 Thumbs.db
 .DS_Store
+
+# User-authorized model snapshots; live assets and all logs remain ignored
+!/models/**/*.bin
+!/models/**/*.onnx
