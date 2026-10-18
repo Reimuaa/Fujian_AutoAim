@@ -24,6 +24,7 @@ public:
   YOLO26(const std::string & config_path, bool debug);
 
   std::list<Armor> detect(const cv::Mat & bgr_img, int frame_count) override;
+  std::list<Armor> detect(const cv::Mat & bgr_img, int frame_count, bool full_frame) override;
   YoloDetectionDiagnostics diagnostics() const override { return last_diagnostics_; }
 
   std::list<Armor> postprocess(
@@ -67,7 +68,6 @@ private:
   ov::Tensor input_tensor_;   // 预绑定的tensor
 
   cv::Rect roi_;
-  cv::Point2f offset_;
   cv::Mat tmp_img_, color_converted_;
 
   Detector detector_;
@@ -83,10 +83,12 @@ private:
   cv::Point2f get_center_norm(const cv::Mat & bgr_img, const cv::Point2f & center) const;
 
   std::list<Armor> parse(double scale, int pad_x, int pad_y, cv::Mat & output,
-                         const cv::Mat & bgr_img, const cv::Mat & tmp_img, int frame_count);
+                         const cv::Mat & bgr_img, const cv::Mat & tmp_img, int frame_count,
+                         const cv::Rect & detection_roi);
 
   void save(const Armor & armor) const;
-  void draw_detections(const cv::Mat & img, const std::list<Armor> & armors, int frame_count) const;
+  void draw_detections(const cv::Mat & img, const std::list<Armor> & armors, int frame_count,
+                       const cv::Rect & detection_roi) const;
   void sort_keypoints(std::vector<cv::Point2f> & keypoints);
   bool refine_color(Armor & armor, const cv::Mat & rgb_img, int frame_count);
   bool refine_corners(Armor & armor, const cv::Mat & image);

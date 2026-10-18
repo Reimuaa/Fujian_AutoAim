@@ -21,7 +21,7 @@ public:
     double angular_jerk_variance = 20.0;
     double measurement_variance_floor = std::pow(1.0 * M_PI / 180.0, 2);
     double nis_reject_threshold = 16.0;
-    double max_dt_s = 0.10;
+    double max_dt_s = 0.10;  // Maximum integration step, not the total prediction horizon.
     int min_trusted_updates = 6;
     double trusted_rate_variance = 4.0;
     double max_trusted_abs_rate_rad_s = std::numeric_limits<double>::infinity();
@@ -56,7 +56,17 @@ public:
   void predict(double dt_s)
   {
     if (!initialized_ || !std::isfinite(dt_s) || dt_s <= 0.0) return;
-    const double dt = std::min(dt_s, std::max(1e-3, config_.max_dt_s));
+    const double max_step_s = std::max(1e-3, config_.max_dt_s);
+    const double requested_steps = std::ceil(dt_s / max_step_s);
+    // An abnormal stale timestamp must not block the sending thread or silently
+    // yield a trusted, shortened forecast. A fresh observation reinitializes it.
+    constexpr int max_prediction_steps = 1000;
+    if (!std::isfinite(requested_steps) || requested_steps > max_prediction_steps) {
+      initialized_ = false;
+      return;
+    }
+    const int steps = std::max(1, static_cast<int>(requested_steps));
+    const double dt = dt_s / steps;
     const double dt2 = dt * dt;
     const double dt3 = dt2 * dt;
     const double dt4 = dt3 * dt;
@@ -66,15 +76,19 @@ public:
     F << 1.0, dt, 0.5 * dt2,
          0.0, 1.0, dt,
          0.0, 0.0, 1.0;
-    x_ = F * x_;
 
     const double q = std::max(0.0, config_.angular_jerk_variance);
     Eigen::Matrix3d Q;
     Q << dt5 / 20.0, dt4 / 8.0, dt3 / 6.0,
          dt4 / 8.0, dt3 / 3.0, dt2 / 2.0,
          dt3 / 6.0, dt2 / 2.0, dt;
-    P_ = F * P_ * F.transpose() + q * Q;
-    stabilize_covariance();
+    // Target advances its timestamp by dt_s, so yaw and covariance must advance
+    // by the same complete duration, including both Aimer prediction stages.
+    for (int step = 0; step < steps; ++step) {
+      x_ = F * x_;
+      P_ = F * P_ * F.transpose() + q * Q;
+      stabilize_covariance();
+    }
   }
 
   UpdateResult update(double measured_body_yaw_rad, double measurement_variance)

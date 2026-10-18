@@ -22,7 +22,16 @@
 
 ## 新克隆的资源准备
 
-旧 Git 历史和本地历史备份已删除，源码仓库不再提供二进制资源恢复入口。
-相机共享库需从对应厂商 SDK 安装；模型需由当前资源持有人提供，按 `artifacts.json` 中的路径放置，并核对 SHA-256。
+新环境需单独安装ROS 2 Humble、OpenVINO 2024.6和厂商相机SDK，并向资源持有人取得上述模型文件。源码依赖通过固定的Git子模块获取；模型训练源码和训练数据不在本分支中。
+
+Ubuntu常用编译依赖：
+
+```bash
+sudo apt-get install build-essential cmake libopencv-dev libeigen3-dev \
+  libceres-dev libfmt-dev libspdlog-dev libyaml-cpp-dev nlohmann-json3-dev \
+  libusb-1.0-0-dev python3-yaml
+git submodule update --init --recursive
+```
+
 运行 `python3 scripts/check_runtime_assets.py` 校验当前模型和 SDK。该脚本只读取文件，不联网、不恢复旧文件、不启动程序。
-现有小电脑与 Windows 工作区的当前运行资源原地保留。仅克隆源码并不能获得模型、SDK 或直接运行程序。
+资源就绪后使用 `bash scripts/build.sh standard` 编译，产物只写入 `build/`。现有小电脑和Windows工作区的运行资源原地保留，本次没有重新安装环境或替换资源。

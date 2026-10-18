@@ -33,6 +33,7 @@ install/
 # Runtime models, recordings and generated state (manifest: docs/artifacts.json)
 /assets/*
 !/assets/README.md
+/models/
 *.onnx
 *.pt
 *.pth
@@ -86,3 +87,18 @@ backups/
 .codex-backups/
 Thumbs.db
 .DS_Store
+
+# Local references and generated diagnostics are not the formal project.
+/linux步兵/
+/omni-code-main/
+/ui_dump/
+/gestalt_record.jsonl
+/kernel.errors.txt
+
+# Runtime recovery tools and manifests are excluded from this source branch.
+/docs/recovery.json
+/docs/recovery.md
+/docs/runtime-environment.json
+/scripts/package_runtime.py
+/scripts/restore_runtime.py
+/tests/test_runtime_recovery.py

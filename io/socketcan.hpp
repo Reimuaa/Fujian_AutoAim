@@ -1,6 +1,32 @@
 #ifndef IO__SOCKETCAN_HPP
 #define IO__SOCKETCAN_HPP
 
+#ifdef _WIN32
+// Windows gestalt build: io/cboard.hpp -> io/socketcan.hpp must compile, but
+// SocketCAN is never instantiated outside Linux. Provide minimal type stubs.
+#include <cstdint>
+#include <functional>
+#include <string>
+
+namespace io
+{
+struct can_frame
+{
+  std::uint32_t can_id;
+  std::uint8_t can_dlc;
+  std::uint8_t data[8];
+};
+
+class SocketCAN
+{
+public:
+  SocketCAN(const std::string &, std::function<void(const can_frame &)>) {}
+  void write(can_frame *) const {}
+};
+}  // namespace io
+
+#else  // _WIN32
+
 #include <linux/can.h>
 #include <net/if.h>
 #include <sys/epoll.h>
@@ -155,5 +181,7 @@ private:
 };
 
 }  // namespace io
+
+#endif  // _WIN32
 
 #endif  // IO__SOCKETCAN_HPP

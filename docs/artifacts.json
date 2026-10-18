@@ -1,5 +1,5 @@
 {
-  "description": "Current external runtime dependencies only. Obtain SDK libraries from vendors and model files from the resource owner; Git history is not a resource source.",
+  "description": "Current external runtime paths and SHA-256 only. Models and SDK libraries are provided separately and are not stored in this source branch.",
   "files": [
     {
       "path": "assets/tiny_resnet.onnx",

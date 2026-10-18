@@ -20,6 +20,7 @@ public:
   {
     double vehicle_enter_rad_s = 0.8;
     double vehicle_exit_rad_s = 0.5;
+    bool high_speed_phase_enabled = true;
     double high_speed_enter_rad_s = 3.2;
     double high_speed_exit_rad_s = 2.5;
     double mode_dwell_s = 0.15;
@@ -178,12 +179,14 @@ public:
 private:
   Mode desired_mode(double abs_rate) const
   {
-    if (mode_ == Mode::high_speed_phase) {
-      if (abs_rate >= config_.high_speed_exit_rad_s) {
+    if (config_.high_speed_phase_enabled) {
+      if (mode_ == Mode::high_speed_phase &&
+          abs_rate >= config_.high_speed_exit_rad_s) {
+        return Mode::high_speed_phase;
+      } else if (mode_ != Mode::high_speed_phase &&
+                 abs_rate >= config_.high_speed_enter_rad_s) {
         return Mode::high_speed_phase;
       }
-    } else if (abs_rate >= config_.high_speed_enter_rad_s) {
-      return Mode::high_speed_phase;
     }
     if (mode_ == Mode::vehicle || mode_ == Mode::high_speed_phase) {
       return abs_rate >= std::max(0.0, config_.vehicle_exit_rad_s)

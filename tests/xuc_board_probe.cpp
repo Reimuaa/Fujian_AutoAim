@@ -49,6 +49,7 @@ int main(int argc, char ** argv)
       << "xuc_imu_pitch_sign: 1\n"
       << "xuc_allow_control: false\n"
       << "xuc_allow_shoot: false\n"
+      << "infantry_diagnostics_enabled: true\n"
       << "xuc_require_feedback_for_control: true\n";
   }
 
@@ -74,6 +75,7 @@ int main(int argc, char ** argv)
   int valid_samples = 0;
   int invalid_samples = 0;
   bool was_valid = false;
+  io::XucShooterFeedback latest_feedback{};
   const auto start = std::chrono::steady_clock::now();
   auto next_log = start;
 
@@ -82,6 +84,8 @@ int main(int argc, char ** argv)
     if (safe_heartbeat) xuc.send(safe_command);
 
     const bool valid = xuc.rx_valid();
+    const auto samples = xuc.take_shooter_feedback();
+    if (!samples.empty()) latest_feedback = samples.back();
     if (valid) {
       ++valid_samples;
     } else {
@@ -93,10 +97,15 @@ int main(int argc, char ** argv)
       if (valid) {
         std::printf(
           "[RX] valid=1 mode=%u robot_id=%u bullet_speed=%.3f bullet_count=%u "
-          "imu_pitch=%.6f imu_yaw=%.6f\n",
+          "imu_pitch=%.6f imu_yaw=%.6f feeder_speed_rpm=%.0f "
+          "friction_current_raw=%d fire_flag=%u fire_tick_ms=%u host_rx_ns=%lld\n",
           static_cast<unsigned>(xuc.mode()), static_cast<unsigned>(xuc.robot_id()),
           xuc.bullet_speed(), static_cast<unsigned>(xuc.bullet_count()),
-          xuc.imu_pitch(), xuc.imu_yaw());
+          xuc.imu_pitch(), xuc.imu_yaw(), xuc.feeder_speed_rpm(),
+          static_cast<int>(latest_feedback.friction_current_raw),
+          static_cast<unsigned>(latest_feedback.fire_flag),
+          static_cast<unsigned>(latest_feedback.fire_tick_ms),
+          static_cast<long long>(latest_feedback.host_rx_ns));
       } else {
         std::printf("[RX] valid=0 waiting_or_timeout\n");
       }

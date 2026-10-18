@@ -16,14 +16,15 @@ Target::Target(
   Eigen::VectorXd P0_dig, const YawESKF::Config & yaw_eskf_config)
 : Target(
     armor, t, radius, armor_num, std::move(P0_dig), yaw_eskf_config,
-    IteratedUpdateConfig{})
+    IteratedUpdateConfig{}, CenterProcessConfig{})
 {
 }
 
 Target::Target(
   const Armor & armor, std::chrono::steady_clock::time_point t, double radius, int armor_num,
   Eigen::VectorXd P0_dig, const YawESKF::Config & yaw_eskf_config,
-  const IteratedUpdateConfig & iterated_update_config)
+  const IteratedUpdateConfig & iterated_update_config,
+  const CenterProcessConfig & center_process_config)
 : name(armor.name),
   armor_type(armor.type),
   jumped(false),
@@ -35,6 +36,8 @@ Target::Target(
   is_converged_(false),
   yaw_eskf_(yaw_eskf_config),
   iterated_update_config_(iterated_update_config),
+  center_process_config_(center_process_config),
+  center_acceleration_variance_(center_process_config.acceleration_variance),
   t_(t)
 {
   auto r = radius;
@@ -120,9 +123,15 @@ void Target::predict(double dt)
     v1 = 10;   // 前哨站加速度方差
     v2 = 0.1;  // 前哨站角加速度方差
   } else {
-    v1 = 100;  // 加速度方差
+    const bool trusted_gyro_rotation =
+      center_process_config_.gyro_adaptive_enabled && yaw_eskf_.trusted() &&
+      std::abs(yaw_eskf_.rate()) >= center_process_config_.gyro_rate_threshold_rad_s;
+    v1 = trusted_gyro_rotation
+      ? center_process_config_.gyro_acceleration_variance
+      : center_process_config_.acceleration_variance;
     v2 = 64;  // 角加速度方差
   }
+  center_acceleration_variance_ = v1;
   auto a = dt * dt * dt * dt / 4;
   auto b = dt * dt * dt / 2;
   auto c = dt * dt;
@@ -431,6 +440,11 @@ int Target::yaw_eskf_accepted_updates() const { return yaw_eskf_.accepted_update
 
 int Target::yaw_eskf_rejected_updates() const { return yaw_eskf_.rejected_updates(); }
 
+double Target::center_acceleration_variance() const
+{
+  return center_acceleration_variance_;
+}
+
 bool Target::armor_motion_trusted(int id) const
 {
   return id >= 0 && id < armor_num_ && id < static_cast<int>(armor_motion_filters_.size()) &&
@@ -453,8 +467,18 @@ double Target::armor_motion_nis(int id) const
 
 std::vector<Eigen::Vector4d> Target::armor_xyza_list(bool prefer_direct_motion) const
 {
+  return armor_xyza_from_state(ekf_x(), prefer_direct_motion);
+}
+
+std::vector<Eigen::Vector4d> Target::whole_ekf_armor_xyza_list() const
+{
+  return armor_xyza_from_state(ekf_.x, false);
+}
+
+std::vector<Eigen::Vector4d> Target::armor_xyza_from_state(
+  const Eigen::VectorXd & state, bool prefer_direct_motion) const
+{
   std::vector<Eigen::Vector4d> _armor_xyza_list;
-  Eigen::VectorXd state = ekf_x();
 
   for (int i = 0; i < armor_num_; i++) {
     auto angle = tools::limit_rad(state[6] + i * 2 * CV_PI / armor_num_);

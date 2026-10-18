@@ -5,6 +5,11 @@ import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
+EXCLUDED = {'docs/recovery.json', 'docs/recovery.md', 'docs/runtime-environment.json',
+            'scripts/package_runtime.py', 'scripts/restore_runtime.py',
+            'tests/test_runtime_recovery.py'}
+EXCLUDED_ROOTS = {'models', 'logs', 'data', 'records', 'imgs', 'build',
+                  'linux步兵', 'omni-code-main', 'ui_dump'}
 FORBIDDEN = {'.bin', '.hex', '.elf', '.axf', '.exe', '.dll', '.so', '.dylib', '.a', '.lib',
              '.o', '.obj', '.pdb', '.pyc', '.pyo', '.onnx', '.pt', '.pth', '.engine',
              '.avi', '.mp4', '.zip', '.tar', '.gz', '.tgz', '.7z', '.log'}
@@ -28,7 +33,8 @@ def main():
         name = raw_name.decode('utf-8')
         path = PurePosixPath(name)
         count += 1
-        if (path.suffix.lower() in FORBIDDEN or '.so.' in path.name or
+        if (name in EXCLUDED or path.parts[0] in EXCLUDED_ROOTS or
+                path.suffix.lower() in FORBIDDEN or '.so.' in path.name or
                 (name.startswith('assets/') and name != 'assets/README.md')):
             errors.append(f'Non-source resource is tracked: {name}')
         with (ROOT / name).open('rb') as handle:
@@ -41,9 +47,11 @@ def main():
     must_ignore = ['build/test', 'firmware/sentry/build/test', 'firmware/infantry/build-arm/a.o',
                    'CMakeCache.txt', 'compile_commands.json', 'temp.elf', 'temp.hex', 'temp.bin',
                    'libtest.so.1', 'assets/yolo26.xml', 'assets/yolo26.bin', 'logs/run.log',
-                   '__pycache__/x.pyc', '.env', 'id_ed25519', 'io/hikrobot/lib/amd64/libMvCameraControl.so']
+                   '__pycache__/x.pyc', '.env', 'id_ed25519', 'io/hikrobot/lib/amd64/libMvCameraControl.so',
+                   'models/detection/yolo26.xml', 'models/classification/tiny_resnet.onnx',
+                   *sorted(EXCLUDED)]
     must_keep = ['CMakeLists.txt', 'configs/standard.yaml', 'configs/calibration.yaml',
-                 'src/standard.cpp', 'firmware/sentry/STM32F405.cpp', 'scripts/build.sh',
+                 'src/standard.cpp', 'firmware/sentry/STM32F405/STM32F405.cpp', 'scripts/build.sh',
                  '.github/workflows/check.yml', '.env.example', 'assets/README.md', 'docs/artifacts.json']
     for name in must_ignore + must_keep:
         result = git('check-ignore', '--no-index', '-q', '--', name)
