@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -58,13 +59,19 @@ struct XucShooterFeedback
   int16_t feeder_speed_rpm;
 };
 
+struct XucShotTransmission
+{
+  int64_t begin_ns = 0, complete_ns = 0;
+  double yaw_raw = 0.0, pitch_raw = 0.0;
+};
+
 // XUC 上位机→下位机：与新版下位机 RxPacket_TJ 完全一致（14 字节）
 #pragma pack(push, 1)
 struct XucRxPacket
 {
   uint8_t head[2];   // 'S' 'P'
-  uint8_t control;   // 是否控制云台
-  uint8_t shoot;     // 是否开火
+  uint8_t control;   // 0 MCU扫描, 1 当前有效目标, 2 停止发射并请求REAL返程
+  uint8_t shoot;     // 单包工作请求；下一包必须恢复0
   float yaw;         // 目标 yaw 角
   float pitch;       // 目标 pitch 角
   uint16_t crc16;    // CRC16（低字节在前）
@@ -78,7 +85,7 @@ static_assert(offsetof(XucRxPacket, crc16) == 12, "XucRxPacket CRC offset must b
 struct XucTxPacket
 {
   uint8_t head[2];        // 'S' 'P'
-  uint8_t mode;           // 0 空闲, 1 自瞄, 2 小符, 3 大符
+  uint8_t mode;           // 1 REAL到达工作区阶段（不是视觉有目标标志）
   uint8_t robot_id;       // 3 红方, 103 蓝方
   float bullet_speed;     // 弹速 (m/s)
   uint16_t bullet_count;  // omni-code当前实现为回传包递增序号
@@ -107,7 +114,7 @@ public:
 
   bool enabled() const { return enabled_; }
   void send(const Command & cmd);
-  // Debug caller only: send() itself remains the compact-mode path unchanged.
+  // Debug caller only; both paths serialize with the heartbeat transmitter.
   // Returns whether this request started a new software high/low cycle.
   bool send_debug(const Command & cmd, const XucShotDebugContext * request = nullptr);
   bool shot_debug_enabled() const { return shot_debug_ != nullptr; }
@@ -124,6 +131,7 @@ public:
 
   // 下位机回传数据（接收线程更新；rx_valid() 为 false 时这些值不可信）
   bool rx_valid() const;
+  bool work_zone_ready() const { return enabled_ && rx_valid() && mode() == 1; }
   int64_t last_rx_ns() const
   {
     return last_rx_ns_.load(std::memory_order_relaxed);
@@ -148,17 +156,13 @@ public:
   {
     return static_cast<double>(last_tx_pitch_raw_.load(std::memory_order_relaxed));
   }
-  bool last_tx_control() const
+  uint8_t last_tx_control() const
   {
-    return last_tx_control_.load(std::memory_order_relaxed) != 0;
+    return last_tx_control_.load(std::memory_order_relaxed);
   }
   uint8_t last_tx_shoot() const
   {
     return last_tx_shoot_.load(std::memory_order_relaxed);
-  }
-  double shoot_hold_ms() const
-  {
-    return static_cast<double>(shoot_hold_duration_ns_) / 1.0e6;
   }
   double shoot_low_ms() const
   {
@@ -194,6 +198,12 @@ public:
   int64_t last_shoot_tx_ns() const
   {
     return last_shoot_tx_ns_.load(std::memory_order_acquire);
+  }
+  // A heartbeat's following low must not erase the last successful high record.
+  XucShotTransmission last_shot_transmission() const
+  {
+    std::lock_guard<std::mutex> lock(send_mutex_);
+    return last_shot_transmission_;
   }
   double imu_pitch() const
   {
@@ -245,6 +255,10 @@ private:
   struct ShotDebug;
   std::unique_ptr<ShotDebug> shot_debug_;
   void recv_loop();
+  void heartbeat_loop();
+  void cache_command_locked(const Command & cmd);
+  bool send_locked(const Command & cmd);
+  bool send_debug_locked(const Command & cmd, const XucShotDebugContext * request);
   bool shoot_request_ready_at(int64_t now_ns) const;
 
   serial::Serial serial_;
@@ -264,16 +278,21 @@ private:
   double max_yaw_excursion_rad_ = 0.0;
   bool control_session_active_ = false;
   double control_yaw_anchor_raw_ = 0.0;
-  int64_t shoot_hold_duration_ns_ = 450000000;
-  int64_t shoot_low_duration_ns_ = 200000000;
-  int64_t shoot_min_interval_ns_ = 700000000;
-  int64_t shoot_hold_until_ns_ = 0;
+  int64_t shoot_low_duration_ns_ = 50000000;
+  int64_t shoot_min_interval_ns_ = 0;
   int64_t shoot_low_until_ns_ = 0;
   int64_t shoot_next_request_ns_ = 0;
   bool shoot_low_pending_ = false;
-  bool shoot_cycle_tx_started_ = false;
-  double shoot_hold_yaw_command_ = 0.0;
-  double shoot_hold_pitch_command_ = 0.0;
+  bool return_requested_ = false;
+  mutable std::mutex send_mutex_;
+  XucShotTransmission last_shot_transmission_;
+  Command heartbeat_command_{false, false, 0.0, 0.0};
+  int64_t heartbeat_period_ns_ = 25000000;
+  int64_t target_timeout_ns_ = 150000000;
+  std::thread heartbeat_thread_;
+  std::mutex heartbeat_wait_mutex_;
+  std::condition_variable heartbeat_wake_;
+  std::atomic<bool> heartbeat_quit_{false};
 
   std::thread recv_thread_;
   std::atomic<bool> recv_quit_{false};

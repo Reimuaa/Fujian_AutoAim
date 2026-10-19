@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstring>
 #include <iterator>
+#include <stdexcept>
 #include <vector>
 #include <nlohmann/json.hpp>
 
@@ -17,7 +18,7 @@
 
 namespace io
 {
-// One producer (the sending thread), one consumer. Only the debug constructor
+// Producers are serialized by send_mutex_; one consumer. Only the debug constructor
 // allocates the queue/worker/logger. Formatting and I/O stay on the consumer.
 struct XucSender::ShotDebug
 {
@@ -144,10 +145,17 @@ XucSender::XucSender(const std::string & config_path)
     max_yaw_excursion_rad_ =
       std::max(0.0, yaml["xuc_max_yaw_excursion_rad"].as<double>());
   }
-  if (yaml["xuc_shoot_hold_ms"]) {
-    const double hold_ms = std::clamp(
-      yaml["xuc_shoot_hold_ms"].as<double>(), 50.0, 1000.0);
-    shoot_hold_duration_ns_ = static_cast<int64_t>(hold_ms * 1.0e6);
+  if (yaml["xuc_heartbeat_hz"]) {
+    const double hz = yaml["xuc_heartbeat_hz"].as<double>();
+    if (!std::isfinite(hz) || (hz != 0.0 && (hz < 30.0 || hz > 100.0)))
+      throw std::invalid_argument("xuc_heartbeat_hz must be 30-100Hz, or 0 for offline transport tests");
+    heartbeat_period_ns_ = hz > 0.0 ? static_cast<int64_t>(1e9 / hz) : 0;
+  }
+  if (yaml["xuc_target_loss_ms"]) {
+    const double ms = yaml["xuc_target_loss_ms"].as<double>();
+    if (!std::isfinite(ms) || ms < 100.0 || ms > 200.0)
+      throw std::invalid_argument("xuc_target_loss_ms must be 100-200ms");
+    target_timeout_ns_ = static_cast<int64_t>(ms * 1e6);
   }
   if (yaml["xuc_shoot_low_ms"]) {
     const double low_ms = std::clamp(
@@ -180,17 +188,19 @@ XucSender::XucSender(const std::string & config_path)
     }
     // 启动接收线程：解析新版 TxPacket_TJ
     recv_thread_ = std::thread([this] { recv_loop(); });
+    if (heartbeat_period_ns_ > 0)
+      heartbeat_thread_ = std::thread([this] { heartbeat_loop(); });
     tools::logger()->info(
       "[XUC] serial opened {} @ {} baud, angles=rad, yaw_sign={}, pitch_sign={}, "
       "imu_yaw_sign={}, imu_pitch_sign={}, allow_control={}, allow_shoot={}, "
       "require_feedback={}, require_auto_mode={}, max_yaw_excursion_deg={:.2f}, "
-      "lock_pitch={}, shoot_hold_ms={:.0f}, shoot_low_ms={:.0f}, min_request_interval_ms={:.0f}",
+      "lock_pitch={}, shoot=single_packet, shoot_low_ms={:.0f}, min_request_interval_ms={:.0f}, heartbeat_hz={:.1f}",
       port, baud, yaw_sign_, pitch_sign_, imu_yaw_sign_, imu_pitch_sign_, allow_control_,
       allow_shoot_, require_feedback_for_control_, require_auto_mode_for_control_,
       max_yaw_excursion_rad_ * 180.0 / M_PI, lock_pitch_for_control_,
-      static_cast<double>(shoot_hold_duration_ns_) / 1.0e6,
       static_cast<double>(shoot_low_duration_ns_) / 1.0e6,
-      static_cast<double>(shoot_min_interval_ns_) / 1.0e6);
+      static_cast<double>(shoot_min_interval_ns_) / 1.0e6,
+      heartbeat_period_ns_ > 0 ? 1e9 / heartbeat_period_ns_ : 0.0);
     if (!allow_control_) {
       tools::logger()->warn("[XUC][SAFE] control output is forced to zero");
     }
@@ -205,6 +215,9 @@ XucSender::XucSender(const std::string & config_path)
 
 XucSender::~XucSender()
 {
+  heartbeat_quit_.store(true, std::memory_order_release);
+  heartbeat_wake_.notify_all();
+  if (heartbeat_thread_.joinable()) heartbeat_thread_.join();
   recv_quit_.store(true, std::memory_order_relaxed);
   if (recv_thread_.joinable()) {
     recv_thread_.join();
@@ -334,14 +347,15 @@ bool XucSender::imu_at(
 
 bool XucSender::shoot_request_ready_at(int64_t now_ns) const
 {
-  return enabled_ && serial_.isOpen() && allow_shoot_ && control_ready() &&
-    shoot_hold_until_ns_ == 0 && !shoot_low_pending_ &&
+  return enabled_ && serial_.isOpen() && allow_shoot_ && control_ready() && !return_requested_ &&
+    !shoot_low_pending_ &&
     (shoot_low_until_ns_ == 0 || now_ns >= shoot_low_until_ns_) &&
     now_ns >= shoot_next_request_ns_;
 }
 
 bool XucSender::shoot_request_ready() const
 {
+  std::lock_guard<std::mutex> lock(send_mutex_);
   const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
     std::chrono::steady_clock::now().time_since_epoch()).count();
   return shoot_request_ready_at(now_ns);
@@ -354,13 +368,21 @@ void XucSender::note_shot_debug_drop() noexcept
 
 void XucSender::record_shot_debug(nlohmann::json && snapshot) noexcept
 {
+  std::lock_guard<std::mutex> lock(send_mutex_);
   if (shot_debug_) shot_debug_->push(std::move(snapshot));
 }
 
 bool XucSender::send_debug(const Command & cmd, const XucShotDebugContext * request)
 {
+  std::lock_guard<std::mutex> lock(send_mutex_);
+  cache_command_locked(cmd);
+  return send_debug_locked(cmd, request);
+}
+
+bool XucSender::send_debug_locked(const Command & cmd, const XucShotDebugContext * request)
+{
   if (!shot_debug_) {
-    send(cmd);
+    send_locked(cmd);
     return false;
   }
   const auto ns_now = [] {
@@ -370,13 +392,11 @@ bool XucSender::send_debug(const Command & cmd, const XucShotDebugContext * requ
   const auto dispatch_begin_ns = ns_now();
   const auto count_before = successful_tx_count();
   const auto high_before = last_shoot_tx_ns();
-  const auto hold_before = shoot_hold_until_ns_;
   const auto low_before = shoot_low_until_ns_;
-  send(cmd);  // Identical control, packet construction and serial-write path.
+  const bool requested = send_locked(cmd);
   const auto dispatch_end_ns = ns_now();
   const bool tx_ok = successful_tx_count() != count_before;
-  const bool accepted = request && request->id != 0 && cmd.control && cmd.shoot &&
-    hold_before == 0 && shoot_hold_until_ns_ > 0;
+  const bool accepted = request && request->id != 0 && requested;
   auto & debug = *shot_debug_;
   if (accepted) {
     debug.cycle = *request;
@@ -426,7 +446,45 @@ bool XucSender::send_debug(const Command & cmd, const XucShotDebugContext * requ
 
 void XucSender::send(const Command & cmd)
 {
-  if (!enabled_ || !serial_.isOpen()) return;
+  std::lock_guard<std::mutex> lock(send_mutex_);
+  cache_command_locked(cmd);
+  send_debug_locked(cmd, nullptr);
+}
+
+void XucSender::cache_command_locked(const Command & cmd)
+{
+  return_requested_ = return_requested_ || cmd.request_return;
+  heartbeat_command_ = cmd;
+  // A heartbeat may repeat ownership/angles but never repeat a fire request.
+  heartbeat_command_.shoot = false;
+  heartbeat_command_.inhibit_shoot = true;
+  const auto now = std::chrono::steady_clock::now().time_since_epoch();
+  const auto deadline = std::chrono::duration_cast<std::chrono::nanoseconds>(now).count() + target_timeout_ns_;
+  heartbeat_command_.target_valid_until_ns = heartbeat_command_.target_valid_until_ns == 0
+    ? deadline : std::min(heartbeat_command_.target_valid_until_ns, deadline);
+}
+
+void XucSender::heartbeat_loop()
+{
+  const auto poll = std::chrono::nanoseconds(std::min<int64_t>(heartbeat_period_ns_ / 2, 10000000));
+  while (!heartbeat_quit_.load(std::memory_order_acquire)) {
+    {
+      std::lock_guard<std::mutex> lock(send_mutex_);
+      const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+      if (last_tx_ns() == 0 || now_ns - last_tx_ns() >= heartbeat_period_ns_)
+        send_debug_locked(heartbeat_command_, nullptr);
+    }
+    std::unique_lock<std::mutex> wait_lock(heartbeat_wait_mutex_);
+    heartbeat_wake_.wait_for(wait_lock, poll, [this] {
+      return heartbeat_quit_.load(std::memory_order_acquire);
+    });
+  }
+}
+
+bool XucSender::send_locked(const Command & cmd)
+{
+  if (!enabled_ || !serial_.isOpen()) return false;
 
   XucRxPacket pkt{};
   pkt.head[0] = 'S';
@@ -434,43 +492,25 @@ void XucSender::send(const Command & cmd)
   const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
     std::chrono::steady_clock::now().time_since_epoch()).count();
   const bool link_ready = control_ready();
-  if (!link_ready && shoot_hold_until_ns_ > 0) {
-    // Cancel high output on loss/exit, but require a successfully sent zero
-    // followed by the complete low interval. Neither deadline is reset by
-    // repeated idle packets, feedback loss, or a brief AUTO switch transition.
-    shoot_hold_until_ns_ = 0;
-    shoot_low_pending_ = true;
-  }
-  if (link_ready && shoot_hold_until_ns_ > 0 && now_ns >= shoot_hold_until_ns_) {
-    shoot_hold_until_ns_ = 0;
-    shoot_low_pending_ = true;
-  }
+  if (!link_ready) heartbeat_command_.control = false;
   if (!shoot_low_pending_ && shoot_low_until_ns_ > 0 && now_ns >= shoot_low_until_ns_) {
     shoot_low_until_ns_ = 0;
   }
-  const bool new_shoot_request =
-    cmd.control && cmd.shoot && shoot_request_ready_at(now_ns);
-  if (new_shoot_request) {
-    shoot_hold_until_ns_ = now_ns + shoot_hold_duration_ns_;
-    shoot_cycle_tx_started_ = false;
-    shoot_hold_yaw_command_ = cmd.yaw;
-    shoot_hold_pitch_command_ = cmd.pitch;
-  }
-  const bool shoot_hold_active =
-    link_ready && allow_shoot_ && now_ns < shoot_hold_until_ns_;
-  const bool control_requested = link_ready && (cmd.control || shoot_hold_active);
-  pkt.control = control_requested ? 1 : 0;
-  // The lower board treats a bounded shoot=1 level as one single-shot request.
-  // A successfully transmitted shoot=0 packet starts the mandatory low interval,
-  // so slow frames or failed writes cannot shorten the configured release time.
-  pkt.shoot = shoot_hold_active ? 1 : 0;
-
-  const double selected_yaw_command =
-    shoot_hold_active ? shoot_hold_yaw_command_ : cmd.yaw;
-  const double selected_pitch_command =
-    shoot_hold_active ? shoot_hold_pitch_command_ : cmd.pitch;
-  double target_yaw_raw = yaw_sign_ * selected_yaw_command;
-  double target_pitch_raw = pitch_sign_ * selected_pitch_command;
+  return_requested_ = return_requested_ || cmd.request_return;
+  double target_yaw_raw = yaw_sign_ * cmd.yaw;
+  double target_pitch_raw = pitch_sign_ * cmd.pitch;
+  const bool finite_angles = std::isfinite(static_cast<float>(target_yaw_raw)) &&
+    std::isfinite(static_cast<float>(target_pitch_raw));
+  const bool fresh = cmd.target_valid_until_ns == 0 || now_ns < cmd.target_valid_until_ns;
+  const bool control_requested = !return_requested_ && link_ready && cmd.control && fresh && finite_angles;
+  pkt.control = return_requested_ ? 2 : (control_requested ? 1 : 0);
+  const bool new_shoot_request = control_requested && cmd.shoot && !cmd.inhibit_shoot &&
+    shoot_request_ready_at(now_ns);
+  pkt.shoot = new_shoot_request ? 1 : 0;
+  // Even a failed/short high write may have reached the MCU. Require a confirmed
+  // low packet before another request; never retry a stale high automatically.
+  if (new_shoot_request) shoot_low_pending_ = true;
+  if (!control_requested) target_yaw_raw = target_pitch_raw = 0.0;
   const bool bounded_session =
     max_yaw_excursion_rad_ > 0.0 || lock_pitch_for_control_;
 
@@ -518,17 +558,12 @@ void XucSender::send(const Command & cmd)
     if (written == sizeof(buf)) {
       const auto write_complete_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
-      if (pkt.shoot == 1 && !shoot_cycle_tx_started_) {
-        // Also catches the first successful retry after an initial failed write.
-        // Start the complete hold and the hard cadence from that success only;
-        // continuing high packets must not extend either deadline.
-        shoot_cycle_tx_started_ = true;
-        shoot_hold_until_ns_ = write_complete_ns + shoot_hold_duration_ns_;
+      if (pkt.shoot == 1) {
         shoot_next_request_ns_ = write_complete_ns + shoot_min_interval_ns_;
+        last_shot_transmission_ = {now_ns, write_complete_ns, pkt.yaw, pkt.pitch};
         last_shoot_tx_ns_.store(now_ns, std::memory_order_release);
         tools::logger()->info(
-          "[XUC][TX] shoot=1 hold_ms={:.0f} control=1",
-          static_cast<double>(shoot_hold_duration_ns_) / 1.0e6);
+          "[XUC][TX] shoot=1 single_packet=1 control=1");
       }
       if (shoot_low_pending_ && pkt.shoot == 0) {
         shoot_low_pending_ = false;
@@ -551,6 +586,7 @@ void XucSender::send(const Command & cmd)
   } catch (const std::exception & e) {
     tools::logger()->warn("[XUC] write failed: {}", e.what());
   }
+  return new_shoot_request;
 }
 
 std::vector<XucShooterFeedback> XucSender::take_shooter_feedback()

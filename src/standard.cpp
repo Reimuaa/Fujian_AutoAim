@@ -9,6 +9,7 @@
 #include <iterator>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <system_error>
 #include <thread>
 #include <utility>
@@ -37,6 +38,7 @@
 #include "tasks/auto_aim/solver.hpp"
 #include "tasks/auto_aim/tracker.hpp"
 #include "tasks/auto_aim/yolo.hpp"
+#include "tasks/auto_aim/work_zone_target.hpp"
 #include "tools/exiter.hpp"
 #include "tools/img_tools.hpp"
 #include "tools/logger.hpp"
@@ -834,6 +836,18 @@ int main(int argc, char * argv[])
   tools::logger()->info("[ROS2] Visualizer initialized");
 #endif
 
+  auto_aim::WorkZoneTarget::Config work_zone_config;
+  if (integration_yaml["xuc_target_confirm_frames"])
+    work_zone_config.confirm_frames = integration_yaml["xuc_target_confirm_frames"].as<int>();
+  if (integration_yaml["xuc_target_loss_ms"])
+    work_zone_config.loss_hold_s = integration_yaml["xuc_target_loss_ms"].as<double>() / 1000.0;
+  if (work_zone_config.confirm_frames < 2 || work_zone_config.confirm_frames > 3 ||
+      !std::isfinite(work_zone_config.loss_hold_s) || work_zone_config.loss_hold_s < 0.100 ||
+      work_zone_config.loss_hold_s > 0.200)
+    throw std::invalid_argument("XUC target confirmation must be 2-3 frames and loss 100-200ms");
+  auto_aim::WorkZoneTarget work_zone_target(work_zone_config);
+  uint64_t work_zone_track_epoch = 0;
+
   io::CBoard cboard(config_path);
   io::Camera camera(config_path);
   io::XucSender xuc(config_path);  // 新版XUC：接收IMU，发送目标角
@@ -1208,7 +1222,8 @@ int main(int argc, char * argv[])
     auto t1 = std::chrono::steady_clock::now();  // 🔍 性能监控
     // YOLO26 color memory is measured in frames. Pass a real increasing frame
     // index; the implicit -1 previously kept stale color memories forever.
-    const bool full_frame_search_used = roi_reacquisition_enabled && full_frame_search;
+    const bool full_frame_search_used = roi_reacquisition_enabled &&
+      (full_frame_search || (xuc.enabled() && work_zone_target.needs_full_frame()));
     auto armors = detector.detect(img, camera_frame_count, full_frame_search_used);
     const auto detection_diagnostics = infantry_diagnostics_enabled
       ? detector.diagnostics() : auto_aim::YoloDetectionDiagnostics{};
@@ -1874,8 +1889,8 @@ int main(int argc, char * argv[])
     // hand-over.  Synchronize it to the actual lower-board yaw outside AUTO or
     // on a genuine visual loss, so re-entering AUTO cannot dump a stale target
     // into the inner position loop in one frame.
-    // omni-code exposes AUTO readiness through mode only. robot_id is an
-    // identity value (103 on this lower board), not a bit field of gate states.
+    // REAL stays active on the MCU; mode_TJ=1 means the work-zone phase.
+    // It does not mean vision currently sees a valid target.
     const bool lower_auto_ready_now = xuc.enabled() && xuc.rx_valid() &&
       xuc.mode() == static_cast<uint8_t>(io::Mode::auto_aim);
     const double yaw_before_final_rate_rad = command.yaw;
@@ -1926,7 +1941,23 @@ int main(int argc, char * argv[])
       command.control = false;
       command.shoot = false;
     }
-    const bool native_shoot = shooter.shoot(command, aimer, targets, ypr);
+    // Qualify current observations before fire/event accounting. The MCU alone
+    // scans around its arrival angle; control=0 must never carry a host scan.
+    const auto work_zone_previous_state = work_zone_target.state();
+    const auto work_zone_now = std::chrono::steady_clock::now();
+    if (tracker.frame_diagnostics().initialized_this_frame) ++work_zone_track_epoch;
+    const auto work_zone_output = work_zone_target.update({
+      std::chrono::duration<double>(work_zone_now.time_since_epoch()).count(),
+      std::chrono::duration<double>(t.time_since_epoch()).count(),
+      xuc.work_zone_ready(),
+      xuc.enabled() && xuc.control_ready() && xuc_imu_sync_valid,
+      !targets.empty() && (tracker.state() == "detecting" || tracker.state() == "tracking") &&
+        direct_measurement_from_tracker && direct_yaw_measurement_fresh &&
+        direct_pitch_measurement_fresh && command.control,
+      command.yaw, command.pitch,
+      targets.empty() ? uint64_t{0} : work_zone_track_epoch});
+    command.inhibit_shoot = xuc.enabled() && work_zone_output.inhibit_fire;
+    const bool native_shoot = !command.inhibit_shoot && shooter.shoot(command, aimer, targets, ypr);
     fire_gate_snapshot_valid = false;
     fire_first_blocker = -1;
     if (xuc_fire_guard_enabled) {
@@ -2241,7 +2272,7 @@ int main(int argc, char * argv[])
         : (vehicle_predicted_fire_active
              ? gyro_yaw_gate_native_open
              : stationary_yaw_gate_open);
-      const bool fire_candidate = command.control &&
+      const bool fire_candidate = !command.inhibit_shoot && command.control &&
         auto_mode_active &&
         convergence_gate_open && one_face_gate_open && motion_transition_gate_open &&
         command_cadence_gate_open &&
@@ -2528,6 +2559,38 @@ int main(int argc, char * argv[])
       if (!lower_auto_ready_now) yaw_tracking_lower_armed = false;
     }
 
+    // Apply target ownership after PI. A brief loss holds the last valid final
+    // angles without firing; expiration hands scanning back to the MCU.
+    if (xuc.enabled()) {
+      command.control = work_zone_output.control;
+      command.target_valid_until_ns = static_cast<int64_t>(work_zone_output.valid_until_s * 1e9);
+      if (work_zone_output.inhibit_fire) command.shoot = false;
+      if (work_zone_output.hold_angles) {
+        command.yaw = work_zone_output.yaw;
+        command.pitch = work_zone_output.pitch;
+      } else if (command.control) {
+        work_zone_target.remember_final_command(command.yaw, command.pitch);
+      }
+    }
+    if (xuc.enabled() && work_zone_output.inhibit_fire) {
+      yaw_tracking_integral_raw_rad = 0.0;
+      yaw_tracking_initialized = false;
+      yaw_tracking_lower_armed = false;
+      const double held_yaw = work_zone_output.hold_angles ? command.yaw :
+        xuc.raw_yaw_correction_to_command(xuc.raw_imu_yaw());
+      if (xuc.rx_valid() && std::isfinite(held_yaw)) {
+        final_yaw_command_filtered = held_yaw;
+        final_yaw_command_initialized = true;
+      }
+      final_yaw_command_last_update = work_zone_now;
+      final_yaw_lower_armed = false;
+    }
+    if (xuc.enabled() && work_zone_previous_state != work_zone_output.state) {
+      tools::logger()->info("[XUC][TARGET] {} -> {} control={}",
+        auto_aim::WorkZoneTarget::name(work_zone_previous_state),
+        auto_aim::WorkZoneTarget::name(work_zone_output.state), command.control);
+    }
+
     // Dry-run diagnostics: world-coordinate stability and final command.
     static int dryrun_log_counter = 0;
     if (infantry_diagnostics_enabled && ++dryrun_log_counter % 20 == 0) {
@@ -2639,7 +2702,7 @@ int main(int argc, char * argv[])
     }
 
     // Attach a software shot id to each qualified request. XucSender converts
-    // this one-frame request into the lower board's high/low single-shot sequence;
+    // this one-frame request into one high packet followed by low packets;
     // that protocol still supplies no confirmed projectile-exit time.
     uint64_t issued_shot_id = 0;
     if (xuc.enabled() && command.shoot) {
@@ -2747,6 +2810,7 @@ int main(int argc, char * argv[])
     // in continuous acquisition mode; sending does not timestamp its exposure.
     const uint64_t tx_count_before = xuc.enabled()
       ? xuc.successful_tx_count() : 0;
+    const int64_t shot_tx_before = xuc.last_shoot_tx_ns();
     if (xuc.enabled()) {
       if (infantry_diagnostics_enabled && shot_prediction_debug) {
         const io::XucShotDebugContext context{
@@ -2893,8 +2957,8 @@ int main(int argc, char * argv[])
         xuc.send(command);
       }
       if (command.shoot) {
-        const bool shot_tx_ok = xuc.successful_tx_count() > tx_count_before &&
-          xuc.last_tx_shoot() == 1;
+        const auto shot_tx = xuc.last_shot_transmission();
+        const bool shot_tx_ok = shot_tx.begin_ns > shot_tx_before;
         xuc_pending_shot_tx_ok = shot_tx_ok;
         if (infantry_diagnostics_enabled) tools::logger()->info(
           "[SHOT_TX] id={} tx_ok={} tx_attempt_ns={} tx_write_complete_ns={} "
@@ -2903,10 +2967,10 @@ int main(int argc, char * argv[])
           "feeder_motor_turns_est_at_request={:+.2f} "
           "feed_slot_observation=unknown projectile_exit=unknown",
           issued_shot_id, shot_tx_ok,
-          shot_tx_ok ? xuc.last_tx_ns() : 0,
-          shot_tx_ok ? xuc.last_tx_complete_ns() : 0,
-          shot_tx_ok ? xuc.last_tx_yaw_raw() * 180.0 / M_PI : NAN,
-          shot_tx_ok ? xuc.last_tx_pitch_raw() * 180.0 / M_PI : NAN,
+          shot_tx_ok ? shot_tx.begin_ns : 0,
+          shot_tx_ok ? shot_tx.complete_ns : 0,
+          shot_tx_ok ? shot_tx.yaw_raw * 180.0 / M_PI : NAN,
+          shot_tx_ok ? shot_tx.pitch_raw * 180.0 / M_PI : NAN,
           xuc.feeder_speed_rpm(), xuc_pending_feeder_turns_at_request);
         const int64_t tx_ns = xuc.last_shoot_tx_ns();
         if (shot_tx_ok && tx_ns > 0) {
@@ -2987,6 +3051,8 @@ int main(int argc, char * argv[])
           {"image_size_px", {img.cols, img.rows}},
           {"native_prediction_valid", native_prediction_valid && native.valid},
           {"native_prediction_trusted", native_prediction_trusted && native.valid},
+          {"work_zone_target_state", auto_aim::WorkZoneTarget::name(work_zone_output.state)},
+          {"work_zone_inhibit_fire", work_zone_output.inhibit_fire},
           {"native_geometry_source", native.whole_ekf_geometry
             ? "whole_ekf_rigid" : "existing"},
           {"native_prediction_ns", native.valid
@@ -3028,7 +3094,7 @@ int main(int argc, char * argv[])
             ? nlohmann::json(xuc.last_tx_complete_ns()) : nlohmann::json(nullptr)},
           {"tx_raw_yaw_rad", tx_ok ? number(xuc.last_tx_yaw_raw()) : nlohmann::json(nullptr)},
           {"tx_raw_pitch_rad", tx_ok ? number(xuc.last_tx_pitch_raw()) : nlohmann::json(nullptr)},
-          {"tx_control", tx_ok && xuc.last_tx_control()},
+          {"tx_control", tx_ok ? static_cast<int>(xuc.last_tx_control()) : 0},
           {"tx_shoot", tx_ok ? nlohmann::json(xuc.last_tx_shoot()) : nlohmann::json(nullptr)},
           {"feedback_pose_ns", feedback_valid
             ? nlohmann::json(duration_cast<nanoseconds>(feedback_pose.timestamp.time_since_epoch()).count())
@@ -3187,7 +3253,7 @@ int main(int argc, char * argv[])
       const bool rx_valid = xuc.enabled() && xuc.rx_valid();
       const bool tx_ok = xuc.enabled() && xuc.successful_tx_count() > tx_count_before;
       const auto tx_ns = tx_ok ? xuc.last_tx_ns() : 0;
-      const auto tx_control = tx_ok && xuc.last_tx_control();
+      const auto tx_control = tx_ok ? static_cast<int>(xuc.last_tx_control()) : 0;
       const auto tx_yaw_raw = tx_ok ? xuc.last_tx_yaw_raw() : NAN;
       const auto tx_pitch_raw = tx_ok ? xuc.last_tx_pitch_raw() : NAN;
       const auto rx_yaw_raw = rx_valid ? xuc.raw_imu_yaw() : NAN;
@@ -3528,9 +3594,8 @@ int main(int argc, char * argv[])
         trace["tx_shoot"] = tx_ok
           ? nlohmann::json(static_cast<int>(xuc.last_tx_shoot()))
           : nlohmann::json(nullptr);
-        trace["shoot_hold_active"] = tx_ok && xuc.last_tx_shoot() == 1;
-        trace["shoot_hold_continuation"] = tx_ok && xuc.last_tx_shoot() == 1 &&
-          !command.shoot;
+        trace["shoot_protocol"] = "single_packet";
+        trace["tx_sample_basis"] = "latest_wire_packet_may_be_heartbeat";
         trace["feeder_feedback_raw"] = xuc.enabled()
           ? finite_value(xuc.feeder_speed_rpm()) : nlohmann::json(nullptr);
         trace["feeder_feedback_units"] = "motor_rotor_rpm";

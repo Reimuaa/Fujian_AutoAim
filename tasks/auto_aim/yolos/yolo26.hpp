@@ -13,6 +13,7 @@
 #include "tasks/auto_aim/armor.hpp"
 #include "tasks/auto_aim/adaptive_corner_refiner.hpp"
 #include "tasks/auto_aim/detector.hpp"
+#include "tasks/auto_aim/lightbar_color.hpp"
 #include "tasks/auto_aim/yolo.hpp"
 
 namespace auto_aim
@@ -47,6 +48,8 @@ private:
   int color_min_brightness_;
   int color_min_pixels_per_bar_;
   int color_hold_frames_;
+  bool require_lit_bars_ = false;
+  LightbarColorGate lightbar_color_gate_;
   int letterbox_value_;
 
   struct ColorMemory
