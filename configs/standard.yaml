@@ -127,13 +127,15 @@ tracker_center_acceleration_variance: 100.0
 tracker_gyro_center_process_noise_enabled: true
 tracker_gyro_center_rate_threshold_rad_s: 0.8
 tracker_gyro_center_acceleration_variance: 10.0
-# Robust iterated whole-vehicle update.  Yaw remains federated with YawESKF.
+# Robust iterated whole-vehicle EKF update, also supplying yaw in the EKF-only trial.
 whole_state_iekf_enabled: true
 whole_state_iekf_max_iterations: 4
 whole_state_iekf_stop_threshold: 0.0001
 whole_state_iekf_huber_threshold: 2.5
-# Independent SO(2) yaw ESKF used for model selection and future face phase.
-# The 11-state EKF remains responsible for vehicle centre/radius/height.
+# Temporary whole-EKF trial: disable ESKF updates, phase/rate substitution and CV geometry.
+# true restores the previous ESKF path; restart the field program after changing it.
+yaw_eskf_enabled: false
+# When disabled, min updates, rate std and max abs rate below gate whole-EKF trust.
 yaw_eskf_angular_jerk_variance: 20.0
 yaw_eskf_measurement_floor_deg: 1.0
 yaw_eskf_nis_reject_threshold: 16.0
@@ -152,9 +154,10 @@ comming_angle: 60
 leaving_angle: 20
 
 decision_speed: 0.8
-# Base prediction: 85 ms delay plus projectile flight time.
-# Keep both Aimer speed branches equal; event timing is configured separately.
-high_speed_delay_time: 0.330
+# Explicit motion-mode delays; changing high speed must not alter low speed.
+# All three retain the current 330ms base; event timing remains separate.
+stationary_delay_time: 0.330
+high_speed_delay_time: 0.338
 low_speed_delay_time: 0.330
 
 actuation_delay_ms: 0
@@ -243,7 +246,8 @@ xuc_allow_shoot: true               # 弹道偏高实弹测量；由现场操作
 xuc_heartbeat_hz: 40.0             # 独立于相机；发送合法CRC包，正常调度下高于20Hz
 xuc_target_confirm_frames: 3        # 连续有效观测，有限yaw/pitch，才允许control=1
 xuc_target_loss_ms: 150.0           # 短暂丢失保持上次有效角度且禁发；超时control=0恢复MCU扫描
-xuc_shoot_low_ms: 50.0             # 首个成功shoot=0包后保持低电平50ms，结束后重新判定开火
+xuc_shoot_low_ms: 50.0             # 静止/低速：保持原低电平释放50ms，无额外请求间隔
+xuc_high_speed_shoot_low_ms: 100.0  # 仅高速：按请求时模式锁存低电平释放100ms，另需满足高速最小请求间隔
 # shoot=1只发送一个数据包，下一包恢复0；不再按100ms保持高电平。
 # control=0无有效目标/恢复MCU扫描，1有效目标接管，2显式请求REAL返程。
 xuc_fire_guard_enabled: true       # require fresh measured armor in both axes
@@ -252,8 +256,8 @@ xuc_fire_yaw_tolerance_deg: 3.0    # 0.91m约±4.8cm，仍在小装甲板水平�
 xuc_fire_pitch_tolerance_deg: 1.1  # 介于无射击的0.8°与明显低弹的2.0°之间；配合更强Pitch闭环
 xuc_gyro_center_follow_enabled: true
 xuc_gyro_omega_threshold_rad_s: 0.8
-# Trust-aware armor -> vehicle -> phase-clock model selection.
-# Temporarily use vehicle prediction for all rotation speeds; retain armor mode.
+# Independent stationary / low_speed / high_speed classification.
+# Enable the optional PLL predictor only for the high_speed field trial.
 xuc_high_speed_phase_enabled: false
 xuc_vehicle_model_enter_rad_s: 0.8
 xuc_vehicle_model_exit_rad_s: 0.45
@@ -284,8 +288,17 @@ xuc_gyro_predicted_fire_enabled: true
 # while the physical phase event clock is unlocked.  This prevents event=0,
 # cycle=-1 rounds such as shots 1-20 in the 2026-09-11 23:34 field log.
 xuc_gyro_require_event_lock_for_fire: true
-xuc_gyro_predicted_yaw_tolerance_deg: 0.35
+xuc_gyro_predicted_yaw_tolerance_deg: 0.3
+# High-speed-only gate; the previous key remains the accepted low-speed gate.
+xuc_high_speed_predicted_yaw_tolerance_deg: 0.2
 xuc_gyro_predicted_yaw_trim_deg: 0.0
+# Past-only same-face forecast residual; only in the selected high_speed mode.
+# Flat model: >=3 completed passages, 8s history, bounded +/-0.3deg; high speed only.
+xuc_high_speed_face_residual_enabled: true
+# Refine by nearby forecast phase after independent past-turn validation.
+# At most +/-0.3deg extra, +/-0.6deg total; the firing gate stays +/-0.2deg.
+# Falls back to the original per-face correction; adds no firing lock/wait.
+xuc_high_speed_face_phase_residual_enabled: true
 xuc_gyro_visibility_yaw_tolerance_deg: 8.0
 xuc_gyro_fire_min_consecutive_frames: 2
 # At ~5 rad/s and 60 FPS the same armor advances ~5 deg/frame; a four-armor
@@ -327,13 +340,12 @@ xuc_range_filter_tau_ms: 80
 xuc_range_filter_max_rate_mps: 6.0
 xuc_range_filter_raw_blend: 0.05
 xuc_range_filter_max_raw_residual_m: 0.40
-# Commands are now issued only near the lower board's physical ready time.  Use
-# the resulting short, repeatable launch path instead of predicting against the
-# 20--746 ms queue delay observed when recovery was disabled.
-xuc_event_fire_delay_s: 0.085
-xuc_event_fire_delay_min_ms: 65
-xuc_event_fire_delay_max_ms: 105
-# 当前omni-code回传包没有拨弹电机状态，保留85ms标定值，不做伪反馈自适应。
+# PLL request delay is independent of the Aimer base delay and flight time.
+# Fixed-delay trial: both bounds equal nominal, disabling the +/-20ms allowance.
+xuc_event_fire_delay_s: 0.330
+xuc_event_fire_delay_min_ms: 330
+xuc_event_fire_delay_max_ms: 330
+# 当前omni-code回传包没有拨弹电机状态，按用户要求试验330ms，不做伪反馈自适应。
 xuc_shot_delay_adaptation_enabled: false
 xuc_shot_delay_reference_ms: 0
 xuc_shot_delay_sample_min_ms: 3
@@ -393,4 +405,5 @@ xuc_event_require_face_consistency: false
 # the next face. A shot also requires the gimbal to be following its command.
 xuc_event_face_max_alignment_deg: 15.0
 xuc_event_gimbal_tracking_tolerance_deg: 4.0
-xuc_shot_rearm_ms: 0                # 0取消额外最小请求间隔；仍保留100ms高电平和50ms低电平
+xuc_shot_rearm_ms: 0                # 静止/低速保持原节奏，无额外最小请求间隔
+xuc_high_speed_shot_rearm_ms: 1000  # 仅高速：距最近shoot=1成功发送完成至少1000ms；到期重判，不补发旧请求

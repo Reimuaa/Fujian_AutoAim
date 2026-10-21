@@ -22,6 +22,8 @@ Aimer::Aimer(const std::string & config_path)
   leaving_angle_ = yaml["leaving_angle"].as<double>() / 57.3;  // degree to rad
   high_speed_delay_time_ = yaml["high_speed_delay_time"].as<double>();
   low_speed_delay_time_ = yaml["low_speed_delay_time"].as<double>();
+  stationary_delay_time_ = yaml["stationary_delay_time"]
+    ? yaml["stationary_delay_time"].as<double>() : low_speed_delay_time_;
   decision_speed_ = yaml["decision_speed"].as<double>();
   if (yaml["left_yaw_offset"].IsDefined() && yaml["right_yaw_offset"].IsDefined()) {
     left_yaw_offset_ = yaml["left_yaw_offset"].as<double>() / 57.3;    // degree to rad
@@ -30,14 +32,51 @@ Aimer::Aimer(const std::string & config_path)
   }
 }
 
-void Aimer::set_delay_adjustment(double adjustment_s)
+void Aimer::set_delay_adjustment(double adjustment_s, AimTiming timing)
 {
-  delay_adjustment_time_ = std::clamp(adjustment_s, -0.050, 0.050);
+  const auto index = static_cast<std::size_t>(timing);
+  if (index >= delay_adjustment_times_.size()) return;
+  delay_adjustment_times_[index] = std::isfinite(adjustment_s)
+    ? std::clamp(adjustment_s, -0.050, 0.050) : 0.0;
+}
+
+EventAimPrediction Aimer::predict_event(
+  const Target & target, std::chrono::steady_clock::time_point impact_time,
+  GyroFaceSelector & selector, int64_t hit_cycle) const
+{
+  EventAimPrediction out;
+  if (target.armor_num() != 4 || hit_cycle < 0 ||
+      impact_time.time_since_epoch().count() <= 0) return out;
+  auto future = target;
+  future.predict(impact_time);
+  const auto state = future.ekf_x();
+  if (state.size() != 11 || !state.allFinite()) return out;
+  const auto faces = future.armor_xyza_list();
+  std::vector<GyroFaceSelector::Candidate> candidates;
+  candidates.reserve(faces.size());
+  for (std::size_t face = 0; face < faces.size(); ++face) {
+    if (faces[face].allFinite())
+      candidates.push_back({static_cast<int>(face), faces[face][3]});
+  }
+  const auto selected = selector.select(
+    candidates, std::atan2(state[2], state[0]), hit_cycle);
+  if (!selected.valid || selected.face_id < 0 ||
+      static_cast<std::size_t>(selected.face_id) >= faces.size()) return out;
+  out.xyza = faces[selected.face_id];
+  if (std::hypot(out.xyza[0], out.xyza[1]) <= 0.0) return out;
+  out.yaw_rad = std::atan2(out.xyza[1], out.xyza[0]) + yaw_offset_;
+  out.valid = std::isfinite(out.yaw_rad);
+  out.face_changed = selected.changed;
+  out.face_id = selected.face_id;
+  out.alignment_rad = selected.alignment_rad;
+  out.prediction_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+    impact_time.time_since_epoch()).count();
+  return out;
 }
 
 io::Command Aimer::aim(
   std::list<Target> targets, std::chrono::steady_clock::time_point timestamp, double bullet_speed,
-  bool to_now, AimPredictionTrace * trace, AimGeometry geometry)
+  bool to_now, AimPredictionTrace * trace, AimGeometry geometry, AimTiming timing)
 {
   if (trace) *trace = AimPredictionTrace{};
   if (targets.empty()) return {false, false, 0, 0};
@@ -52,11 +91,19 @@ io::Command Aimer::aim(
     raw_state.size() == 11 && raw_state.allFinite() &&
     raw_state[8] > 0.05 && raw_state[8] < 0.5 &&
     raw_state[8] + raw_state[9] > 0.05 && raw_state[8] + raw_state[9] < 0.5;
-  if (trace) trace->whole_ekf_geometry = whole_ekf_geometry;
-  double delay_time =
-    (std::abs(target.ekf_x()[7]) > decision_speed_
-       ? high_speed_delay_time_
-       : low_speed_delay_time_) + delay_adjustment_time_;
+  if (trace) trace->whole_ekf_geometry = whole_ekf_geometry || !target.yaw_eskf_enabled();
+  double delay_time;
+  switch (timing) {
+    case AimTiming::stationary: delay_time = stationary_delay_time_; break;
+    case AimTiming::low_speed: delay_time = low_speed_delay_time_; break;
+    case AimTiming::high_speed: delay_time = high_speed_delay_time_; break;
+    default:
+      delay_time = std::abs(target.ekf_x()[7]) > decision_speed_
+        ? high_speed_delay_time_ : low_speed_delay_time_;
+  }
+  const auto timing_index = static_cast<std::size_t>(timing);
+  delay_time += delay_adjustment_times_[timing_index < delay_adjustment_times_.size()
+    ? timing_index : 0];
 
   // Low-speed friction-wheel benches can be well below the competition-speed
   // default.  Preserve the fallback only for missing/invalid telemetry so the
@@ -165,7 +212,8 @@ io::Command Aimer::aim(
 
 io::Command Aimer::aim(
   std::list<Target> targets, std::chrono::steady_clock::time_point timestamp, double bullet_speed,
-  io::ShootMode shoot_mode, bool to_now, AimPredictionTrace * trace, AimGeometry geometry)
+  io::ShootMode shoot_mode, bool to_now, AimPredictionTrace * trace, AimGeometry geometry,
+  AimTiming timing)
 {
   double yaw_offset;
   if (shoot_mode == io::left_shoot && left_yaw_offset_.has_value()) {
@@ -176,7 +224,7 @@ io::Command Aimer::aim(
     yaw_offset = yaw_offset_;
   }
 
-  auto command = aim(targets, timestamp, bullet_speed, to_now, trace, geometry);
+  auto command = aim(targets, timestamp, bullet_speed, to_now, trace, geometry, timing);
   command.yaw = command.yaw - yaw_offset_ + yaw_offset;
 
   return command;
@@ -215,7 +263,8 @@ AimPoint Aimer::choose_aim_point(const Target & target, bool whole_ekf_geometry,
     // reliable target. Prefer its fresh CV track instead of re-selecting among
     // several model faces at every ballistic iteration; the latter produced
     // red-box jumps and corresponding gimbal reversals near a face hand-over.
-    if (target.last_id >= 0 && target.last_id < static_cast<int>(armor_num) &&
+    if (target.yaw_eskf_enabled() && target.last_id >= 0 &&
+        target.last_id < static_cast<int>(armor_num) &&
         target.armor_motion_trusted(target.last_id) &&
         std::abs(delta_angle_list[target.last_id]) <= 75.0 / 57.3) {
       lock_id_ = target.last_id;

@@ -134,6 +134,43 @@ int main(int argc, char ** argv) {
     }
   }
   std::cout << "PASS trusted dual-filter geometry: both directions, ballistic iterations, compact/debug equivalence, stationary/outpost/three-face fallback\n";
+  if(argc==3) {
+    // Alter ONLY the high/static delays in a second fixture. The same low-speed
+    // target/geometry must produce bit-identical commands and prediction times.
+    int isolated=0;
+    for(double omega : {-4.5,-2.4,-.6,0.,.6,2.4,4.5}) {
+      auto_aim::Armor armor(11,.9f,cv::Rect(0,0,100,40),{{0,0},{100,0},{100,40},{0,40}});
+      armor.xyz_in_world={3.3,0.,.05}; armor.ypr_in_world={0.,0.,0.};
+      auto_aim::Target target(armor,stamp,.3,4,Eigen::VectorXd::Ones(11));
+      const_cast<tools::ExtendedKalmanFilter &>(target.ekf()).x[7]=omega;
+      target.jumped=true;
+      auto_aim::Aimer baseline(argv[1]), separated(argv[2]);
+      auto_aim::AimPredictionTrace a,b;
+      const auto original=baseline.aim({target},stamp,28.,false,&a,auto_aim::AimGeometry::whole_ekf);
+      const auto low=separated.aim({target},stamp,28.,false,&b,auto_aim::AimGeometry::whole_ekf,
+        auto_aim::AimTiming::low_speed);
+      assert(a.delay_s==.085 && b.delay_s==.085);
+      assert(original.control==low.control && original.yaw==low.yaw && original.pitch==low.pitch);
+      assert(a.prediction_ns==b.prediction_ns && a.face_id==b.face_id);
+      separated.aim({target},stamp,28.,false,&b,auto_aim::AimGeometry::existing,
+        auto_aim::AimTiming::stationary);
+      assert(b.delay_s==.060);
+      separated.aim({target},stamp,28.,false,&b,auto_aim::AimGeometry::whole_ekf,
+        auto_aim::AimTiming::high_speed);
+      assert(b.delay_s==.140);
+      separated.set_delay_adjustment(.010,auto_aim::AimTiming::high_speed);
+      separated.aim({target},stamp,28.,false,&b,auto_aim::AimGeometry::whole_ekf,
+        auto_aim::AimTiming::high_speed);
+      assert(std::abs(b.delay_s-.150)<1e-12);
+      separated.set_delay_adjustment(.020); // Legacy adaptive caller is isolated too.
+      separated.aim({target},stamp,28.,false,&b,auto_aim::AimGeometry::whole_ekf,
+        auto_aim::AimTiming::low_speed);
+      assert(b.delay_s==.085);
+      ++isolated;
+    }
+    assert(isolated==7);
+    std::cout << "PASS three-mode timing isolation: high/static changes preserve exact low-speed commands for both directions\n";
+  }
 }
 '''
 
@@ -255,6 +292,10 @@ def main():
         config.write_text("yaw_offset: 0.0\npitch_offset: 6.0\ncomming_angle: 75\nleaving_angle: 15\n"
                           "high_speed_delay_time: 0.085\nlow_speed_delay_time: 0.085\ndecision_speed: 0.8\n",
                           encoding="utf-8")
+        isolated_config = temp / "isolated.yaml"
+        isolated_config.write_text(config.read_text(encoding="utf-8").replace(
+            "high_speed_delay_time: 0.085", "high_speed_delay_time: 0.140") +
+            "stationary_delay_time: 0.060\n", encoding="utf-8")
         sources = ["tasks/auto_aim/aimer.cpp", "tasks/auto_aim/target.cpp", "tasks/auto_aim/armor.cpp",
                    "tools/math_tools.cpp", "tools/trajectory.cpp", "tools/extended_kalman_filter.cpp", "tools/logger.cpp"]
         subprocess.run(["g++", "-std=c++17", "-O1", "-pthread", "-I" + str(root),
@@ -262,7 +303,7 @@ def main():
                         str(temp / "test.cpp"), *[str(root / p) for p in sources],
                         "-lopencv_core", "-lyaml-cpp", "-lspdlog", "-lfmt", "-o", str(binary)],
                        check=True, timeout=180)
-        subprocess.run([str(binary), str(config)], check=True, timeout=30, cwd=root)
+        subprocess.run([str(binary), str(config), str(isolated_config)], check=True, timeout=30, cwd=root)
         # Synthetic config has identical Aimer coefficients to the formal
         # config except pitch_offset, which affects pitch only. Use formal
         # config for recorded snapshots and verify the fixed 85 ms delay.

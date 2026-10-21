@@ -2,13 +2,16 @@
 #define AUTO_AIM__AIMER_HPP
 
 #include <Eigen/Dense>
+#include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <limits>
 #include <list>
 
 #include "io/cboard.hpp"
 #include "io/command.hpp"
+#include "gyro_face_selector.hpp"
 #include "target.hpp"
 
 namespace auto_aim
@@ -21,6 +24,8 @@ struct AimPoint
 };
 
 enum class AimGeometry { existing, whole_ekf };
+// Explicit timing in standard; automatic preserves other callers' legacy API.
+enum class AimTiming { automatic, stationary, low_speed, high_speed };
 
 // Optional observer of the existing iterations. Never used for control.
 struct AimPredictionTrace
@@ -35,6 +40,26 @@ struct AimPredictionTrace
   double flight_time_s = std::numeric_limits<double>::quiet_NaN();
 };
 
+// Runtime geometry for one PLL event. No Aimer delay or ballistic iteration is
+// added: the scheduler has already chosen the absolute impact time.
+struct EventAimPrediction
+{
+  bool valid = false, face_changed = false;
+  int face_id = -1;
+  int64_t prediction_ns = 0;
+  Eigen::Vector4d xyza = Eigen::Vector4d::Constant(
+    std::numeric_limits<double>::quiet_NaN());
+  double yaw_rad = std::numeric_limits<double>::quiet_NaN();
+  double alignment_rad = std::numeric_limits<double>::infinity();
+
+  double yaw_in_command_frame(double command_correction_rad) const
+  {
+    return valid && std::isfinite(command_correction_rad)
+      ? std::remainder(yaw_rad + command_correction_rad, 2.0 * std::acos(-1.0))
+      : std::numeric_limits<double>::quiet_NaN();
+  }
+};
+
 class Aimer
 {
 public:
@@ -43,16 +68,20 @@ public:
   io::Command aim(
     std::list<Target> targets, std::chrono::steady_clock::time_point timestamp, double bullet_speed,
     bool to_now = true, AimPredictionTrace * trace = nullptr,
-    AimGeometry geometry = AimGeometry::existing);
+    AimGeometry geometry = AimGeometry::existing, AimTiming timing = AimTiming::automatic);
 
   io::Command aim(
     std::list<Target> targets, std::chrono::steady_clock::time_point timestamp, double bullet_speed,
     io::ShootMode shoot_mode, bool to_now = true, AimPredictionTrace * trace = nullptr,
-    AimGeometry geometry = AimGeometry::existing);
+    AimGeometry geometry = AimGeometry::existing, AimTiming timing = AimTiming::automatic);
 
-  // Applies the same bounded runtime correction to both speed branches.  Their
-  // calibrated base values remain unchanged and are restored with zero.
-  void set_delay_adjustment(double adjustment_s);
+  // Explicit profiles own separate bounded corrections. The default preserves
+  // the legacy automatic caller's correction; it cannot leak into explicit modes.
+  void set_delay_adjustment(double adjustment_s, AimTiming timing = AimTiming::automatic);
+
+  EventAimPrediction predict_event(
+    const Target & target, std::chrono::steady_clock::time_point impact_time,
+    GyroFaceSelector & selector, int64_t hit_cycle) const;
 
 private:
   double yaw_offset_;
@@ -63,7 +92,8 @@ private:
   double lock_id_ = -1;
   double high_speed_delay_time_;
   double low_speed_delay_time_;
-  double delay_adjustment_time_ = 0.0;
+  double stationary_delay_time_;
+  std::array<double, 4> delay_adjustment_times_{};
   double decision_speed_;
 
   AimPoint choose_aim_point(

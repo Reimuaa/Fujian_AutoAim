@@ -63,6 +63,9 @@ public:
 
   Eigen::VectorXd ekf_x() const;
   const tools::ExtendedKalmanFilter & ekf() const;
+  bool yaw_eskf_enabled() const;
+  bool yaw_model_trusted() const;
+  const char * yaw_model_source() const;
   bool yaw_eskf_trusted() const;
   double yaw_eskf_angle() const;
   double yaw_eskf_rate() const;
@@ -96,6 +99,8 @@ private:
   bool is_switch_, is_converged_;
 
   tools::ExtendedKalmanFilter ekf_;
+  // The selected EKF/ESKF source shares the configured warm-up/rate bounds.
+  YawESKF::Config yaw_model_config_{};
   YawESKF yaw_eskf_;
   std::array<ArmorMotionFilter, 4> armor_motion_filters_;
   IteratedUpdateConfig iterated_update_config_;

@@ -53,6 +53,8 @@ int main()
   assert(safe.interval_safe);
   assert(safe.time_until_command_s >= 0.0);
   assert(safe.time_until_command_s < period);
+  assert(std::abs(safe.hit_time_s - (now + safe.time_until_hit_center_s)) < 1e-12);
+  assert(std::abs(safe.hit_time_s - (safe.command_due_time_s + .154 + .155)) < 1e-12);
 
   const auto unsafe = scheduler.solve(
     now, 0.154, 0.034, 0.254, 0.155, 0.020,

@@ -53,7 +53,8 @@ def compile_run(code, name, *, sources=(), libraries=(), fixtures=None, argument
             command = [compiler, "/nologo", "/std:c++17", "/EHsc", "/utf-8", "/O2", "/MD",
                        "/D_USE_MATH_DEFINES", "/DNOMINMAX", "/DFMT_SHARED", "/DSPDLOG_SHARED_LIB",
                        "/DSPDLOG_COMPILED_LIB", "/DSPDLOG_FMT_EXTERNAL", "/DWIN32_LEAN_AND_MEAN",
-                       "/I" + str(temporary), "/I" + str(ROOT), "/I" + str(vcpkg / "include"),
+                       "/I" + str(temporary), "/I" + str(ROOT),
+                       "/I" + str(ROOT / "io/serial/include"), "/I" + str(vcpkg / "include"),
                        "/I" + str(vcpkg / "include/opencv4"),
                        "/I" + str(vcpkg / "include/eigen3"), str(source),
                        *[str(ROOT / p) for p in sources], "/Fo" + str(ROOT / "build") + "/",
@@ -61,7 +62,8 @@ def compile_run(code, name, *, sources=(), libraries=(), fixtures=None, argument
                        *[lib_names.get(lib, lib) + ".lib" for lib in libraries]]
         else:
             command = ["g++", "-std=c++17", "-O1", "-pthread", "-I" + str(temporary),
-                       "-I" + str(ROOT), "-I/usr/include/opencv4", "-I/usr/include/eigen3",
+                       "-I" + str(ROOT), "-I" + str(ROOT / "io/serial/include"),
+                       "-I/usr/include/opencv4", "-I/usr/include/eigen3",
                        str(source), *[str(ROOT / p) for p in sources],
                        *["-l" + lib for lib in libraries], "-o", str(binary)]
         compiled = subprocess.run(command, cwd=ROOT, env=env, text=True,
@@ -322,6 +324,221 @@ xuc_shot_rearm_ms: 0
                               "compact.yaml": config + "infantry_diagnostics_enabled: false\n",
                               "debug.yaml": config + "infantry_diagnostics_enabled: true\n"},
                     arguments=("compact.yaml", "debug.yaml"))
+
+    @unittest.skipIf(sys.platform == "win32", "Linux fake-serial timing fixture; run under local WSL")
+    def test_actual_xuc_high_speed_release_isolation(self):
+        spec = importlib.util.spec_from_file_location("xuc_mode_test", ROOT / "tests/test_xuc_shot_diagnostics.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        source = (ROOT / "src/standard.cpp").read_text(encoding="utf-8")
+        begin = source.index("const bool high_speed_mode = rotation_model.motion_mode ==")
+        classify = source[begin:source.index(";", begin) + 1]
+        begin = source.index("command.high_speed_shoot = high_speed_mode;")
+        tag = source[begin:source.index(";", begin) + 1]
+        harness = module.HARNESS.split("int main(int argc, char ** argv)")[0] + r'''
+#include "tasks/auto_aim/rotation_model_manager.hpp"
+io::Command command_for(auto_aim::RotationModelManager::MotionMode mode,bool shoot=true) {
+  auto_aim::RotationModelManager::Result rotation_model;rotation_model.motion_mode=mode;
+  CLASSIFY
+  io::Command command{true,shoot,.3,.12};
+  TAG
+  return command;
+}
+auto low_begin(io::XucSender & x) {
+  return std::chrono::steady_clock::time_point(std::chrono::nanoseconds(x.last_tx_complete_ns()));
+}
+std::vector<std::vector<uint8_t>> run(const char * path,bool debug) {
+  serial::packets.clear();sink->lines.clear();
+  using Mode=auto_aim::RotationModelManager::MotionMode;
+  const auto high=command_for(Mode::high_speed),low=command_for(Mode::low_speed);
+  const auto stationary=command_for(Mode::stationary);
+  assert(high.high_speed_shoot && !low.high_speed_shoot && !stationary.high_speed_shoot);
+  const auto high_follow=command_for(Mode::high_speed,false);
+  const auto low_follow=command_for(Mode::low_speed,false);
+  {
+    io::XucSender x(path);assert(x.shot_debug_enabled()==debug);
+    assert(x.shoot_low_ms()==50. && x.shoot_low_ms(true)==500.);
+    const auto request=[&](const io::Command & cmd,uint64_t id) {
+      auto c=context(id,id);assert(x.send_debug(cmd,&c)==debug);
+    };
+    request(high,1);assert(x.last_tx_shoot()==1);
+    x.send(low_follow);assert(x.last_tx_shoot()==0);auto began=low_begin(x);
+    std::this_thread::sleep_for(80ms);
+    x.send(low);assert(x.last_tx_shoot()==0 && !x.shoot_request_ready());
+    // A low-speed frame after a high-speed request cannot shorten its 500ms.
+    std::this_thread::sleep_until(began+520ms);assert(x.shoot_request_ready());
+    request(low,2);assert(x.last_tx_shoot()==1);
+    x.send(high_follow);began=low_begin(x);
+    // A high-speed frame after a low-speed request cannot extend its 50ms.
+    std::this_thread::sleep_until(began+70ms);assert(x.shoot_request_ready());
+    request(stationary,3);assert(x.last_tx_shoot()==1);
+    x.send(low_follow);began=low_begin(x);
+    std::this_thread::sleep_until(began+70ms);assert(x.shoot_request_ready());
+    // Failed high/short low preserve the original profile until confirmed low.
+    serial::fail_writes=1;request(high,4);assert(!x.shoot_request_ready());
+    serial::short_writes=1;x.send(low_follow);
+    std::this_thread::sleep_for(70ms);assert(!x.shoot_request_ready());
+    x.send(low_follow);began=low_begin(x);
+    std::this_thread::sleep_until(began+80ms);assert(!x.shoot_request_ready());
+    std::this_thread::sleep_until(began+520ms);assert(x.shoot_request_ready());
+  }
+  size_t highs=0;
+  for(const auto & p:serial::packets) {
+    const auto crc=tools::get_crc16(p.data(),12);
+    assert(p.size()==14 && p[12]==(crc&255) && p[13]==(crc>>8));
+    highs+=p[3]==1;
+  }
+  assert(highs==3);
+  if(debug) {
+    size_t lows=0;
+    for(const auto & e:events()) if(e["kind"]=="first_low") {
+      const int64_t expected=e["id"]==1 || e["id"]==4 ? 500000000 : 50000000;
+      assert(e["low_interval_until_ns"].get<int64_t>()-
+        e["low_interval_begin_ns"].get<int64_t>()==expected);
+      assert(e["low_duration_ms"].get<double>()==expected/1e6);++lows;
+    }
+    assert(lows==4);
+  } else assert(events().empty());
+  return serial::packets;
+}
+int main(int argc,char ** argv) {
+  assert(argc==4);
+  const auto compact=run(argv[1],false),debug=run(argv[2],true);
+  assert(compact==debug);
+  {
+    io::XucSender legacy(argv[3]);
+    assert(legacy.shoot_low_ms()==50. && legacy.shoot_low_ms(true)==50.);
+    auto high=command_for(auto_aim::RotationModelManager::MotionMode::high_speed);
+    legacy.send(high);assert(legacy.last_tx_shoot()==1);
+    high.shoot=false;legacy.send(high);auto began=low_begin(legacy);
+    std::this_thread::sleep_until(began+70ms);assert(legacy.shoot_request_ready());
+  }
+  std::cout<<"PASS actual XUC: stationary/low=50ms high=500ms, request-time profile "
+    "survives both mode transitions and failed writes, single high, CRC, compact/debug "
+    "wire equivalence and legacy default\n";
+}
+'''
+        harness = harness.replace("CLASSIFY", classify).replace("TAG", tag)
+        config = ("xuc_enable: true\nxuc_allow_control: true\nxuc_allow_shoot: true\n"
+                  "xuc_require_feedback_for_control: false\nxuc_require_auto_mode_for_control: false\n"
+                  "xuc_yaw_sign: 1\nxuc_pitch_sign: 1\nxuc_heartbeat_hz: 0\n"
+                  "xuc_shoot_low_ms: 50\nxuc_shot_rearm_ms: 0\n")
+        compile_run(harness, "xuc_high_speed_release_test", sources=("io/xuc.cpp", "tools/crc.cpp"),
+                    libraries=("yaml-cpp", "spdlog", "fmt"),
+                    fixtures={"serial/serial.h": module.SERIAL_STUB,
+                              "compact.yaml": config + "xuc_high_speed_shoot_low_ms: 500\ninfantry_diagnostics_enabled: false\n",
+                              "debug.yaml": config + "xuc_high_speed_shoot_low_ms: 500\ninfantry_diagnostics_enabled: true\n",
+                              "legacy.yaml": config + "infantry_diagnostics_enabled: false\n"},
+                    arguments=("compact.yaml", "debug.yaml", "legacy.yaml"))
+
+    @unittest.skipIf(sys.platform == "win32", "Linux fake-serial timing fixture; run under local WSL")
+    def test_actual_xuc_high_speed_minimum_request_interval(self):
+        spec = importlib.util.spec_from_file_location("xuc_interval_test", ROOT / "tests/test_xuc_shot_diagnostics.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        source = (ROOT / "src/standard.cpp").read_text(encoding="utf-8")
+        begin = source.index("        if (xuc_pending_shot &&")
+        pending = source[begin:source.index(" {", begin)]
+        begin = source.index("      const bool command_cadence_gate_open =")
+        cadence = source[begin:source.index(";", begin) + 1]
+        harness = module.HARNESS.split("int main(int argc, char ** argv)")[0] + r'''
+#include <cstring>
+bool gate(io::XucSender & xuc,bool high_speed_mode,bool & xuc_pending_shot,
+          std::chrono::steady_clock::time_point xuc_pending_shot_time) {
+  const double xuc_shot_rearm_s=xuc.shoot_min_interval_ms()/1000.;
+  const auto feedback_now=std::chrono::steady_clock::now();
+PENDING { xuc_pending_shot=false; }
+CADENCE
+  return command_cadence_gate_open;
+}
+void run(const char * path,bool debug) {
+  serial::packets.clear();serial::packet_times_ns.clear();sink->lines.clear();
+  {
+    io::XucSender x(path);assert(x.shot_debug_enabled()==debug);
+    assert(x.shoot_min_interval_ms()==0. && x.shoot_min_interval_ms(true)==1000.);
+    assert(x.shoot_low_ms()==50. && x.shoot_low_ms(true)==100.);
+    const auto stamp=[](const io::XucShotTransmission & s) {
+      return std::chrono::steady_clock::time_point(std::chrono::nanoseconds(s.complete_ns));
+    };
+    bool pending=true;
+    io::Command high{true,true,.3,.12};high.high_speed_shoot=true;
+    auto follow=high;follow.shoot=false;
+    x.send(high);const auto first=x.last_shot_transmission();x.send(follow);
+    assert(first.complete_ns>0 && !x.shoot_request_ready(true));
+    // High -> low: after the existing 100ms release, not the high-only 1s timer.
+    std::this_thread::sleep_until(stamp(first)+150ms);
+    assert(gate(x,false,pending,stamp(first)) && !pending);
+    assert(!gate(x,true,pending,stamp(first)));
+    io::Command low{true,true,.4,.12};x.send(low);
+    const auto second=x.last_shot_transmission();assert(second.begin_ns>first.begin_ns);
+    follow=low;follow.shoot=false;x.send(follow);pending=true;
+    // Low -> stationary: retain the original 50ms release.
+    std::this_thread::sleep_until(stamp(second)+70ms);
+    assert(gate(x,false,pending,stamp(second)) && !pending);
+    io::Command stationary{true,true,.5,.12};x.send(stationary);
+    const auto accepted=x.last_shot_transmission();assert(accepted.begin_ns>second.begin_ns);
+    follow=stationary;follow.shoot=false;x.send(follow);pending=true;
+    const auto origin=stamp(accepted);
+    // Re-entering high speed measures from the latest successful shot.
+    while(std::chrono::steady_clock::now()<origin+800ms) {
+      auto attempt=high;attempt.yaw=.65;x.send(attempt);
+      assert(x.last_shot_transmission().begin_ns==accepted.begin_ns);
+      std::this_thread::sleep_for(20ms);
+    }
+    const auto before=x.successful_tx_count();
+    std::this_thread::sleep_for(80ms);
+    assert(x.successful_tx_count()>before); // Heartbeat continues during cooldown.
+    follow.yaw=.7;
+    while(std::chrono::steady_clock::now()<origin+1100ms) {
+      x.send(follow);std::this_thread::sleep_for(20ms);
+    }
+    assert(gate(x,true,pending,origin));
+    assert(x.last_shot_transmission().begin_ns==accepted.begin_ns); // No deferred request.
+    auto invalid=high;invalid.control=false;x.send(invalid);
+    assert(x.last_shot_transmission().begin_ns==accepted.begin_ns);
+    x.send(high);assert(x.last_shot_transmission().begin_ns>accepted.begin_ns);
+  }
+  std::vector<int64_t> highs;bool following_changed=false;
+  for(size_t i=0;i<serial::packets.size();++i) {
+    const auto & p=serial::packets[i];const auto crc=tools::get_crc16(p.data(),12);
+    assert(p.size()==14 && p[12]==(crc&255) && p[13]==(crc>>8));
+    if(p[3]==1) highs.push_back(serial::packet_times_ns[i]);
+    float yaw;std::memcpy(&yaw,p.data()+4,sizeof(yaw));
+    following_changed|=p[2]==1 && p[3]==0 && std::abs(yaw-.7)<1e-6;
+  }
+  assert(highs.size()==4 && following_changed);
+  assert(highs[1]-highs[0]<1000000000LL && highs[2]-highs[1]<1000000000LL);
+  assert(highs[3]-highs[2]>=1000000000LL && highs[3]-highs[0]>=1000000000LL);
+}
+int main(int argc,char ** argv) {
+  assert(argc==4);run(argv[1],false);run(argv[2],true);
+  { // Missing new key preserves the previous shared-interval API/configuration.
+    io::XucSender legacy(argv[3]);
+    assert(legacy.shoot_min_interval_ms()==1000. && legacy.shoot_min_interval_ms(true)==1000.);
+    io::Command low{true,true,.3,.12};legacy.send(low);const auto first=legacy.last_shot_transmission();
+    low.shoot=false;legacy.send(low);std::this_thread::sleep_for(80ms);
+    assert(!legacy.shoot_request_ready() && !legacy.shoot_request_ready(true));
+    low.shoot=true;legacy.send(low);assert(legacy.last_shot_transmission().begin_ns==first.begin_ns);
+  }
+  std::cout<<"PASS actual XUC/main gates: high-only >=1000ms, high->low and low->stationary "
+    "retain 100/50ms wire release, low->high cannot bypass 1s, live following/heartbeat, "
+    "no deferred request, control/CRC, compact/debug and legacy default\n";
+}
+'''
+        harness = harness.replace("PENDING", pending).replace("CADENCE", cadence)
+        config = ("xuc_enable: true\nxuc_allow_control: true\nxuc_allow_shoot: true\n"
+                  "xuc_require_feedback_for_control: false\nxuc_require_auto_mode_for_control: false\n"
+                  "xuc_yaw_sign: 1\nxuc_pitch_sign: 1\nxuc_heartbeat_hz: 40\n"
+                  "xuc_shoot_low_ms: 50\nxuc_high_speed_shoot_low_ms: 100\n"
+                  "xuc_shot_rearm_ms: 0\nxuc_high_speed_shot_rearm_ms: 1000\n")
+        compile_run(harness, "xuc_minimum_request_interval_test",
+                    sources=("io/xuc.cpp", "tools/crc.cpp"), libraries=("yaml-cpp", "spdlog", "fmt"),
+                    fixtures={"serial/serial.h": module.SERIAL_STUB,
+                              "compact.yaml": config + "infantry_diagnostics_enabled: false\n",
+                              "debug.yaml": config + "infantry_diagnostics_enabled: true\n",
+                              "legacy.yaml": config.replace("xuc_shot_rearm_ms: 0\nxuc_high_speed_shot_rearm_ms: 1000",
+                                                            "xuc_shot_rearm_ms: 1000")},
+                    arguments=("compact.yaml", "debug.yaml", "legacy.yaml"))
 
     @unittest.skipIf(sys.platform == "win32", "Linux fake-serial timing fixture; run under local WSL")
     def test_heartbeat_during_camera_stall(self):

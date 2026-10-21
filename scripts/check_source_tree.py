@@ -7,7 +7,8 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 EXCLUDED = {'docs/recovery.json', 'docs/recovery.md', 'docs/runtime-environment.json',
             'scripts/package_runtime.py', 'scripts/restore_runtime.py',
-            'tests/test_runtime_recovery.py'}
+            'tests/test_runtime_recovery.py',
+            'firmware/infantry/tools/backup_stm32f405_flash.ps1'}
 EXCLUDED_ROOTS = {'models', 'logs', 'data', 'records', 'imgs', 'build',
                   'linux步兵', 'omni-code-main', 'ui_dump'}
 FORBIDDEN = {'.bin', '.hex', '.elf', '.axf', '.exe', '.dll', '.so', '.dylib', '.a', '.lib',

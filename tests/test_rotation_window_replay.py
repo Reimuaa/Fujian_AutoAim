@@ -105,7 +105,9 @@ int main() {
     // Frozen logs retain the original sender state. Model the unchanged
     // 100/50 ms minimum cadence after an additional simulated request, as decide() does.
     const bool fire_candidate = candidate && request_ns - last_request_ns >= 150000000;
-    const bool gyro_yaw_gate_native_open = yaw;
+    const bool prediction_yaw_gate_open = yaw;
+    const bool prediction_point_gate_open = rotation_fire_window.current_frame_is_better ||
+      rotation_fire_window.exiting_selection_next_step;
     struct { bool shoot = false; } command;
 REQUEST
     if (command.shoot) last_request_ns = request_ns;

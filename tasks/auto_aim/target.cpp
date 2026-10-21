@@ -34,6 +34,7 @@ Target::Target(
   update_count_(0),
   is_switch_(false),
   is_converged_(false),
+  yaw_model_config_(yaw_eskf_config),
   yaw_eskf_(yaw_eskf_config),
   iterated_update_config_(iterated_update_config),
   center_process_config_(center_process_config),
@@ -124,8 +125,8 @@ void Target::predict(double dt)
     v2 = 0.1;  // 前哨站角加速度方差
   } else {
     const bool trusted_gyro_rotation =
-      center_process_config_.gyro_adaptive_enabled && yaw_eskf_.trusted() &&
-      std::abs(yaw_eskf_.rate()) >= center_process_config_.gyro_rate_threshold_rad_s;
+      center_process_config_.gyro_adaptive_enabled && yaw_model_trusted() &&
+      std::abs(ekf_x()[7]) >= center_process_config_.gyro_rate_threshold_rad_s;
     v1 = trusted_gyro_rotation
       ? center_process_config_.gyro_acceleration_variance
       : center_process_config_.acceleration_variance;
@@ -400,7 +401,8 @@ void Target::update_ypda(const Armor & armor, int id)
 
 void Target::update_yaw_eskf(const Armor & armor, int id)
 {
-  if (id < 0 || id >= armor_num_ || armor.ypr_in_world.size() < 1) return;
+  if (!yaw_eskf_.enabled() || id < 0 || id >= armor_num_ ||
+      armor.ypr_in_world.size() < 1) return;
   const double body_yaw_measurement = tools::limit_rad(
     armor.ypr_in_world[0] - id * 2.0 * CV_PI / armor_num_);
   const double center_yaw = std::atan2(
@@ -425,6 +427,27 @@ Eigen::VectorXd Target::ekf_x() const
 }
 
 const tools::ExtendedKalmanFilter & Target::ekf() const { return ekf_; }
+
+bool Target::yaw_eskf_enabled() const { return yaw_eskf_.enabled(); }
+
+bool Target::yaw_model_trusted() const
+{
+  if (yaw_eskf_.enabled()) return yaw_eskf_.trusted();
+  const auto & state = ekf_.x;
+  // Disabling ESKF must neither leave its trust gate permanently closed nor
+  // grant an uninitialized/spiking whole-EKF model prediction authority.
+  return state.size() == 11 && state.allFinite() &&
+    update_count_ >= std::max(4, yaw_model_config_.min_trusted_updates) && !diverged() &&
+    ekf_.P.rows() == 11 && ekf_.P.cols() == 11 &&
+    std::isfinite(ekf_.P(7, 7)) && ekf_.P(7, 7) >= 0.0 &&
+    ekf_.P(7, 7) <= std::max(1e-6, yaw_model_config_.trusted_rate_variance) &&
+    std::abs(state[7]) <= std::max(0.0, yaw_model_config_.max_trusted_abs_rate_rad_s);
+}
+
+const char * Target::yaw_model_source() const
+{
+  return yaw_eskf_.trusted() ? "yaw_eskf" : "whole_ekf";
+}
 
 bool Target::yaw_eskf_trusted() const { return yaw_eskf_.trusted(); }
 
@@ -483,7 +506,8 @@ std::vector<Eigen::Vector4d> Target::armor_xyza_from_state(
   for (int i = 0; i < armor_num_; i++) {
     auto angle = tools::limit_rad(state[6] + i * 2 * CV_PI / armor_num_);
     Eigen::Vector3d xyz = h_armor_xyz(state, i);
-    if (prefer_direct_motion && i < static_cast<int>(armor_motion_filters_.size()) &&
+    if (prefer_direct_motion && yaw_eskf_.enabled() &&
+        i < static_cast<int>(armor_motion_filters_.size()) &&
         armor_motion_filters_[i].trusted()) {
       xyz = armor_motion_filters_[i].position();
     }

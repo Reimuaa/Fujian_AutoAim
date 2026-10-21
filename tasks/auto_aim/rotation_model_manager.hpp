@@ -4,17 +4,20 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <stdexcept>
 
 namespace auto_aim
 {
 
-// Trust-aware selector for the three prediction regimes used by the planner.
+// Motion classification is independent of the optional phase-clock predictor.
+// Disabling PLL must not collapse low/high speed into the same motion mode.
 // It deliberately does not estimate pose: its job is to decide which existing
 // estimator may drive the gimbal/fire policy, and when a phase clock is stale.
 class RotationModelManager
 {
 public:
   enum class Mode { armor = 0, vehicle = 1, high_speed_phase = 2 };
+  enum class MotionMode { stationary = 0, low_speed = 1, high_speed = 2 };
 
   struct Config
   {
@@ -35,23 +38,40 @@ public:
   struct Result
   {
     Mode mode = Mode::armor;
+    MotionMode motion_mode = MotionMode::stationary;
     bool mode_changed = false;
+    bool motion_mode_changed = false;
     bool phase_reset = false;
     bool tracker_trusted = false;
     bool rate_consistent = false;
     bool phase_fire_trusted = false;
     double rate_disagreement_rad_s = std::numeric_limits<double>::infinity();
+    double filtered_abs_rate_rad_s = std::numeric_limits<double>::quiet_NaN();
   };
 
   RotationModelManager() = default;
-  explicit RotationModelManager(const Config & config) : config_(config) {}
+  explicit RotationModelManager(const Config & config) : config_(config)
+  {
+    if (!std::isfinite(config.vehicle_enter_rad_s) || !std::isfinite(config.vehicle_exit_rad_s) ||
+        !std::isfinite(config.high_speed_enter_rad_s) || !std::isfinite(config.high_speed_exit_rad_s) ||
+        config.vehicle_exit_rad_s < 0.0 || config.vehicle_exit_rad_s >= config.vehicle_enter_rad_s ||
+        config.vehicle_enter_rad_s >= config.high_speed_exit_rad_s ||
+        config.high_speed_exit_rad_s >= config.high_speed_enter_rad_s ||
+        !std::isfinite(config.mode_dwell_s) || config.mode_dwell_s < 0.0 ||
+        !std::isfinite(config.rate_filter_tau_s) || config.rate_filter_tau_s < 0.0 ||
+        !std::isfinite(config.tracker_dropout_hold_s) || config.tracker_dropout_hold_s < 0.0)
+      throw std::invalid_argument("Invalid stationary/low/high rotation mode thresholds");
+  }
 
   void reset()
   {
     mode_ = Mode::armor;
-    candidate_mode_ = Mode::armor;
+    motion_mode_ = MotionMode::stationary;
+    candidate_mode_ = MotionMode::stationary;
     candidate_since_s_ = 0.0;
     have_candidate_ = false;
+    have_moving_candidate_ = false;
+    moving_candidate_since_s_ = 0.0;
     have_last_rate_ = false;
     last_abs_ekf_rate_ = 0.0;
     have_filtered_rate_ = false;
@@ -61,6 +81,8 @@ public:
     disagreement_updates_ = 0;
     have_last_trusted_update_ = false;
     last_trusted_update_s_ = 0.0;
+    have_input_time_ = false;
+    last_input_s_ = 0.0;
   }
 
   Result update(
@@ -69,9 +91,21 @@ public:
     double phase_omega_rad_s = std::numeric_limits<double>::quiet_NaN())
   {
     Result out;
+    if (!std::isfinite(now_s) || (have_input_time_ && now_s <= last_input_s_)) {
+      out.mode_changed = mode_ != Mode::armor;
+      out.motion_mode_changed = motion_mode_ != MotionMode::stationary;
+      out.phase_reset = mode_ == Mode::high_speed_phase;
+      reset();
+      return out;
+    }
+    last_input_s_ = now_s;
+    have_input_time_ = true;
     out.tracker_trusted = tracker_converged && std::isfinite(now_s) &&
       std::isfinite(ekf_omega_rad_s);
     if (!out.tracker_trusted) {
+      // Unobserved time never completes a pending classification dwell.
+      have_candidate_ = false;
+      have_moving_candidate_ = false;
       // A detector association hand-over can make convergence false for only a
       // few frames.  Keep the selected motion regime through that gap (fire is
       // still inhibited by tracker_trusted=false) instead of immediately
@@ -80,8 +114,12 @@ public:
           now_s - last_trusted_update_s_ <=
             std::max(0.0, config_.tracker_dropout_hold_s)) {
         out.mode = mode_;
+        out.motion_mode = motion_mode_;
+        out.filtered_abs_rate_rad_s = filtered_abs_rate_;
         return out;
       }
+      out.mode_changed = mode_ != Mode::armor;
+      out.motion_mode_changed = motion_mode_ != MotionMode::stationary;
       out.phase_reset = mode_ == Mode::high_speed_phase;
       reset();
       out.mode = mode_;
@@ -102,18 +140,40 @@ public:
     }
     last_update_s_ = now_s;
     const double abs_rate = filtered_abs_rate_;
-    const Mode desired = desired_mode(abs_rate);
+    out.filtered_abs_rate_rad_s = abs_rate;
+    const MotionMode desired = desired_motion_mode(abs_rate);
+    if (motion_mode_ == MotionMode::stationary && abs_rate >= config_.vehicle_enter_rad_s) {
+      if (!have_moving_candidate_) {
+        have_moving_candidate_ = true;
+        moving_candidate_since_s_ = now_s;
+      }
+    } else {
+      have_moving_candidate_ = false;
+    }
     if (!have_candidate_ || desired != candidate_mode_) {
       candidate_mode_ = desired;
       candidate_since_s_ = now_s;
       have_candidate_ = true;
     }
 
-    if (desired != mode_ &&
-        now_s - candidate_since_s_ >= std::max(0.0, config_.mode_dwell_s)) {
+    MotionMode selected = desired;
+    bool dwell_complete = now_s - candidate_since_s_ >= config_.mode_dwell_s;
+    // At startup, noise around the low/high boundary must not keep a clearly
+    // rotating target in stationary forever. Enter the proven low-speed path
+    // after continuous motion, while high speed still needs its own full dwell.
+    if (!dwell_complete && motion_mode_ == MotionMode::stationary && have_moving_candidate_ &&
+        now_s - moving_candidate_since_s_ >= config_.mode_dwell_s) {
+      selected = MotionMode::low_speed;
+      dwell_complete = true;
+    }
+    if (selected != motion_mode_ && dwell_complete) {
       const Mode old_mode = mode_;
-      mode_ = desired;
-      out.mode_changed = true;
+      motion_mode_ = selected;
+      out.motion_mode_changed = true;
+      mode_ = motion_mode_ == MotionMode::stationary ? Mode::armor
+        : (motion_mode_ == MotionMode::high_speed && config_.high_speed_phase_enabled
+          ? Mode::high_speed_phase : Mode::vehicle);
+      out.mode_changed = mode_ != old_mode;
       out.phase_reset = old_mode == Mode::high_speed_phase ||
         mode_ == Mode::high_speed_phase;
       agreement_updates_ = 0;
@@ -157,6 +217,7 @@ public:
     }
 
     out.mode = mode_;
+    out.motion_mode = motion_mode_;
     out.phase_fire_trusted = mode_ == Mode::high_speed_phase &&
       phase_rate_valid && out.rate_consistent &&
       agreement_updates_ >= std::max(1, config_.rate_agreement_updates) &&
@@ -165,6 +226,17 @@ public:
   }
 
   Mode mode() const { return mode_; }
+  MotionMode motion_mode() const { return motion_mode_; }
+
+  static const char * name(MotionMode mode)
+  {
+    switch (mode) {
+      case MotionMode::stationary: return "stationary";
+      case MotionMode::low_speed: return "low_speed";
+      case MotionMode::high_speed: return "high_speed";
+    }
+    return "unknown";
+  }
 
   static const char * name(Mode mode)
   {
@@ -177,30 +249,25 @@ public:
   }
 
 private:
-  Mode desired_mode(double abs_rate) const
+  MotionMode desired_motion_mode(double abs_rate) const
   {
-    if (config_.high_speed_phase_enabled) {
-      if (mode_ == Mode::high_speed_phase &&
-          abs_rate >= config_.high_speed_exit_rad_s) {
-        return Mode::high_speed_phase;
-      } else if (mode_ != Mode::high_speed_phase &&
-                 abs_rate >= config_.high_speed_enter_rad_s) {
-        return Mode::high_speed_phase;
-      }
-    }
-    if (mode_ == Mode::vehicle || mode_ == Mode::high_speed_phase) {
-      return abs_rate >= std::max(0.0, config_.vehicle_exit_rad_s)
-        ? Mode::vehicle
-        : Mode::armor;
-    }
-    return abs_rate >= config_.vehicle_enter_rad_s ? Mode::vehicle : Mode::armor;
+    if (motion_mode_ == MotionMode::high_speed && abs_rate >= config_.high_speed_exit_rad_s)
+      return MotionMode::high_speed;
+    if (abs_rate >= config_.high_speed_enter_rad_s) return MotionMode::high_speed;
+    if (motion_mode_ != MotionMode::stationary && abs_rate >= config_.vehicle_exit_rad_s)
+      return MotionMode::low_speed;
+    return abs_rate >= config_.vehicle_enter_rad_s
+      ? MotionMode::low_speed : MotionMode::stationary;
   }
 
   Config config_{};
   Mode mode_ = Mode::armor;
-  Mode candidate_mode_ = Mode::armor;
+  MotionMode motion_mode_ = MotionMode::stationary;
+  MotionMode candidate_mode_ = MotionMode::stationary;
   double candidate_since_s_ = 0.0;
   bool have_candidate_ = false;
+  bool have_moving_candidate_ = false;
+  double moving_candidate_since_s_ = 0.0;
   bool have_last_rate_ = false;
   double last_abs_ekf_rate_ = 0.0;
   bool have_filtered_rate_ = false;
@@ -210,6 +277,8 @@ private:
   int disagreement_updates_ = 0;
   bool have_last_trusted_update_ = false;
   double last_trusted_update_s_ = 0.0;
+  bool have_input_time_ = false;
+  double last_input_s_ = 0.0;
 };
 
 }  // namespace auto_aim

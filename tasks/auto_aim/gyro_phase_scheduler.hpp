@@ -70,6 +70,7 @@ public:
     bool valid = false;
     bool interval_safe = false;
     std::int64_t hit_cycle = -1;
+    double hit_time_s = 0.0;
     double command_due_time_s = 0.0;
     double time_until_command_s = std::numeric_limits<double>::infinity();
     double time_until_hit_center_s = std::numeric_limits<double>::infinity();
@@ -407,6 +408,7 @@ public:
     out.face_period_s = face_period_s_;
     out.omega_rad_s = (M_PI / 2.0) / face_period_s_;
     out.hit_cycle = crossing_cycle_ + steps;
+    out.hit_time_s = hit_center_time_s;
     out.command_due_time_s = hit_center_time_s - nominal_total_s;
     out.time_until_command_s = out.command_due_time_s - now_s;
     out.time_until_hit_center_s = hit_center_time_s - now_s;

@@ -81,6 +81,9 @@ public:
     Eigen::VectorXd state_after;
     double whole_nis = std::numeric_limits<double>::quiet_NaN();
     double whole_nees = std::numeric_limits<double>::quiet_NaN();
+    bool yaw_eskf_enabled = true;
+    bool yaw_model_trusted = false;
+    const char * yaw_model_source = "none";
     bool yaw_eskf_trusted = false;
     double yaw_eskf_angle = std::numeric_limits<double>::quiet_NaN();
     double yaw_eskf_rate = std::numeric_limits<double>::quiet_NaN();

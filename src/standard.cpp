@@ -28,6 +28,7 @@
 #include "io/cboard.hpp"
 #include "io/xuc.hpp"
 #include "tasks/auto_aim/aimer.hpp"
+#include "tasks/auto_aim/face_prediction_residual.hpp"
 #include "tasks/auto_aim/gyro_face_selector.hpp"
 #include "tasks/auto_aim/gyro_phase_scheduler.hpp"
 #include "tasks/auto_aim/robust_range_filter.hpp"
@@ -58,6 +59,7 @@ struct RotationFireWindow
   int frames = 0;
   int target_name = -1, target_type = -1, armor_count = 0, face_id = -1;
   bool event_face = false;
+  int64_t hit_cycle = -1;
   double phase_rad = NAN, error_rad = NAN, next_error_rad = NAN;
   double selection_phase_rad = NAN, selection_omega_rad_s = NAN;
   uint64_t frame_sequence = 0;
@@ -70,19 +72,22 @@ struct RotationFireWindow
     bool uses_event_face, double phase, double error,
     std::chrono::steady_clock::time_point time, int required_frames,
     double max_phase_step, double tolerance, uint64_t sequence,
-    double selection_phase, double omega, double coming, double leaving)
+    double selection_phase, double omega, double coming, double leaving,
+    int64_t cycle = -1)
   {
     two_frames_ready = false;
     current_frame_is_better = false;
     exiting_selection_next_step = false;
     next_error_rad = NAN;
-    if (!valid || face < 0 || !std::isfinite(phase) || !std::isfinite(error)) {
+    if (!valid || face < 0 || !std::isfinite(phase) || !std::isfinite(error) ||
+        (uses_event_face && cycle < 0)) {
       frames = 0;
       return;
     }
     const bool continuous = frames > 0 && !rebuilt && time > timestamp &&
       name == target_name && type == target_type && count == armor_count &&
       face == face_id && uses_event_face == event_face &&
+      (!uses_event_face || cycle == hit_cycle) &&
       std::abs(std::remainder(phase - phase_rad, 2.0 * M_PI)) <= max_phase_step;
     const int needed = std::max(2, required_frames);
     frames = continuous ? std::min(frames + 1, needed) : 1;
@@ -113,6 +118,7 @@ struct RotationFireWindow
     armor_count = count;
     face_id = face;
     event_face = uses_event_face;
+    hit_cycle = cycle;
     phase_rad = phase;
     error_rad = error;
     selection_phase_rad = selection_phase;
@@ -180,6 +186,8 @@ int main(int argc, char * argv[])
   }
 
   const auto integration_yaml = YAML::LoadFile(config_path);
+  const bool yaw_eskf_enabled = !integration_yaml["yaw_eskf_enabled"] ||
+    integration_yaml["yaw_eskf_enabled"].as<bool>();
   // Use exactly Aimer's existing degree conversion and configuration source.
   const double selection_coming_rad = integration_yaml["comming_angle"].as<double>() / 57.3;
   const double selection_leaving_rad = integration_yaml["leaving_angle"].as<double>() / 57.3;
@@ -525,13 +533,18 @@ int main(int argc, char * argv[])
   const bool xuc_gyro_require_event_lock_for_fire =
     integration_yaml["xuc_gyro_require_event_lock_for_fire"] &&
     integration_yaml["xuc_gyro_require_event_lock_for_fire"].as<bool>();
-  const double xuc_gyro_predicted_yaw_tolerance_rad =
+  const double xuc_low_speed_predicted_yaw_tolerance_rad =
     (integration_yaml["xuc_gyro_predicted_yaw_tolerance_deg"]
        ? std::clamp(
            integration_yaml["xuc_gyro_predicted_yaw_tolerance_deg"].as<double>(),
            0.1,
            10.0)
        : 1.0) * M_PI / 180.0;
+  const double xuc_high_speed_predicted_yaw_tolerance_rad =
+    integration_yaml["xuc_high_speed_predicted_yaw_tolerance_deg"]
+      ? std::clamp(integration_yaml["xuc_high_speed_predicted_yaw_tolerance_deg"].as<double>(),
+          0.1, 10.0) * M_PI / 180.0
+      : xuc_low_speed_predicted_yaw_tolerance_rad;
   const double xuc_gyro_predicted_yaw_trim_rad =
     (integration_yaml["xuc_gyro_predicted_yaw_trim_deg"]
        ? std::clamp(
@@ -847,6 +860,16 @@ int main(int argc, char * argv[])
     throw std::invalid_argument("XUC target confirmation must be 2-3 frames and loss 100-200ms");
   auto_aim::WorkZoneTarget work_zone_target(work_zone_config);
   uint64_t work_zone_track_epoch = 0;
+  auto_aim::FacePredictionResidual::Config face_residual_config;
+  face_residual_config.enabled = integration_yaml["xuc_high_speed_face_residual_enabled"] &&
+    integration_yaml["xuc_high_speed_face_residual_enabled"].as<bool>();
+  face_residual_config.phase_conditioned_enabled =
+    integration_yaml["xuc_high_speed_face_phase_residual_enabled"] &&
+    integration_yaml["xuc_high_speed_face_phase_residual_enabled"].as<bool>();
+  auto_aim::FacePredictionResidual face_residual_monitor(face_residual_config);
+  uint64_t face_residual_epoch = 1;
+  std::array<int, 3> face_residual_identity{-1, -1, 0};
+  auto_aim::FacePredictionResidual::Output previous_face_residual;
 
   io::CBoard cboard(config_path);
   io::Camera camera(config_path);
@@ -1013,10 +1036,11 @@ int main(int argc, char * argv[])
       tools::logger()->warn("[SHOT_DEBUG] frame capture unavailable: {}", e.what());
     }
   }
-  constexpr std::array<const char *, 14> fire_gate_names = {
+  constexpr std::array<const char *, 17> fire_gate_names = {
     "detection", "target", "tracker_converged", "frame_imu", "auto_mode",
     "control", "yaw_observation", "pitch_observation", "yaw_error",
-    "pitch_error", "face", "motion_transition", "command_rearm", "stable_window"};
+    "pitch_error", "face", "motion_transition", "command_rearm", "stable_window",
+    "prediction_yaw", "prediction_point", "work_zone"};
   std::array<uint64_t, fire_gate_names.size()> fire_blocked_frames{};
   std::array<double, fire_gate_names.size()> fire_blocked_ms{};
   std::array<double, fire_gate_names.size()> fire_longest_episode_ms{};
@@ -1329,6 +1353,7 @@ int main(int argc, char * argv[])
 
     bool tracker_converged = false;
     bool yaw_motion_model_trusted = false;
+    const char * yaw_prediction_source = "none";
     bool vehicle_model_fresh = false;
     bool gyro_model_fresh = false;
     bool gyro_phase_model_trusted = false;
@@ -1340,7 +1365,8 @@ int main(int argc, char * argv[])
     if (!targets.empty()) {
       auto & tracked_target = targets.front();
       tracker_converged = tracked_target.convergened();
-      yaw_motion_model_trusted = tracked_target.yaw_eskf_trusted();
+      yaw_motion_model_trusted = tracked_target.yaw_model_trusted();
+      yaw_prediction_source = tracked_target.yaw_model_source();
       const auto tracked_x = tracked_target.ekf_x();
       if (tracked_x.size() >= 9) {
         gyro_center_yaw = std::atan2(tracked_x[2], tracked_x[0]);
@@ -1356,7 +1382,7 @@ int main(int argc, char * argv[])
           "[YAWESKF] trusted={} angle={:+.3f} omega={:+.3f} alpha={:+.3f} "
           "raw_ekf_omega={:+.3f} nis={:.2f} accepted={} rejected={} "
           "whole_iekf_nis={:.2f} armor_cv_trusted={} armor_v=({:+.2f},{:+.2f},{:+.2f}) "
-          "armor_cv_nis={:.2f}",
+          "armor_cv_nis={:.2f} enabled={} prediction_source={} model_trusted={}",
           tracked_target.yaw_eskf_trusted() ? 1 : 0,
           tracked_target.yaw_eskf_angle(), tracked_target.yaw_eskf_rate(),
           tracked_target.yaw_eskf_acceleration(),
@@ -1367,7 +1393,8 @@ int main(int argc, char * argv[])
           tracked_target.ekf().last_nis,
           tracked_target.armor_motion_trusted(tracked_target.last_id) ? 1 : 0,
           armor_velocity.x(), armor_velocity.y(), armor_velocity.z(),
-          tracked_target.armor_motion_nis(tracked_target.last_id));
+          tracked_target.armor_motion_nis(tracked_target.last_id),
+          yaw_eskf_enabled, yaw_prediction_source, yaw_motion_model_trusted);
       }
     }
     const double model_now_s = std::chrono::duration<double>(
@@ -1376,11 +1403,15 @@ int main(int argc, char * argv[])
     const double prior_phase_omega_rad_s = prior_phase_rate_valid
       ? (M_PI / 2.0) / gyro_phase_scheduler.face_period_s()
       : NAN;
+    const auto & rotation_td = tracker.frame_diagnostics();
+    const bool rotation_model_rebuilt = rotation_td.initialized_this_frame ||
+      rotation_td.nis_reset || rotation_td.diverged;
+    if (rotation_model_rebuilt) rotation_model_manager.reset();
     const auto rotation_model = rotation_model_manager.update(
       model_now_s, tracker_converged && yaw_motion_model_trusted,
       gyro_omega_rad_s,
       prior_phase_rate_valid, prior_phase_omega_rad_s);
-    if (rotation_model.phase_reset) {
+    if (rotation_model.phase_reset || rotation_model_rebuilt) {
       gyro_phase_scheduler.reset();
       gyro_face_selector.reset();
       event_last_fired_cycle = -1;
@@ -1392,12 +1423,25 @@ int main(int argc, char * argv[])
         gyro_omega_rad_s, prior_phase_omega_rad_s,
         rotation_model.rate_disagreement_rad_s);
     }
-    if (rotation_model.mode_changed) {
+    if (rotation_model.mode_changed || rotation_model.motion_mode_changed) {
       tools::logger()->info(
-        "[MODEL] switched to {} ekf_omega={:+.3f}rad_s",
+        "[MODEL] rotation={} predictor={} ekf_omega={:+.3f}rad_s filtered={:.3f}rad_s",
+        auto_aim::RotationModelManager::name(rotation_model.motion_mode),
         auto_aim::RotationModelManager::name(rotation_model.mode),
-        gyro_omega_rad_s);
+        gyro_omega_rad_s, rotation_model.filtered_abs_rate_rad_s);
     }
+    if (rotation_model.motion_mode_changed || rotation_model_rebuilt) {
+      // A candidate observed in one regime cannot qualify the next regime.
+      rotation_fire_window = RotationFireWindow{};
+      xuc_fire_candidate_active = false;
+      xuc_fire_ready_logged = false;
+      xuc_fire_candidate_frames = 0;
+      aimer.set_delay_adjustment(0.0, auto_aim::AimTiming::high_speed);
+    }
+    const bool high_speed_mode = rotation_model.motion_mode ==
+      auto_aim::RotationModelManager::MotionMode::high_speed;
+    const double xuc_gyro_predicted_yaw_tolerance_rad = high_speed_mode
+      ? xuc_high_speed_predicted_yaw_tolerance_rad : xuc_low_speed_predicted_yaw_tolerance_rad;
     if (tracker.frame_diagnostics().initialized_this_frame) {
       xuc_gyro_center_memory_valid = false;
       direct_yaw_control_confirmed = false;
@@ -1570,12 +1614,27 @@ int main(int argc, char * argv[])
         steady_clock::now().time_since_epoch()).count();
     }
     // Selected-face identity is needed by the fire gate even with debug off.
+    auto_aim::AimGeometry aim_geometry = auto_aim::AimGeometry::existing;
+    auto_aim::AimTiming aim_timing = auto_aim::AimTiming::stationary;
+    switch (rotation_model.motion_mode) {
+      case auto_aim::RotationModelManager::MotionMode::stationary:
+        // Keep the accepted stationary plate-following path.
+        break;
+      case auto_aim::RotationModelManager::MotionMode::low_speed:
+        aim_timing = auto_aim::AimTiming::low_speed;
+        if (vehicle_model_fresh) aim_geometry = auto_aim::AimGeometry::whole_ekf;
+        break;
+      case auto_aim::RotationModelManager::MotionMode::high_speed:
+        aim_timing = auto_aim::AimTiming::high_speed;
+        if (vehicle_model_fresh && !gyro_model_fresh)
+          aim_geometry = auto_aim::AimGeometry::whole_ekf;
+        break;
+    }
     auto_aim::AimPredictionTrace native_fire_prediction;
     auto command = aimer.aim(
       targets, t, cboard.bullet_speed, true,
-      &native_fire_prediction,
-      vehicle_model_fresh && !gyro_model_fresh
-        ? auto_aim::AimGeometry::whole_ekf : auto_aim::AimGeometry::existing);
+      &native_fire_prediction, aim_geometry, aim_timing);
+    command.high_speed_shoot = high_speed_mode;
     if (infantry_diagnostics_enabled && shot_prediction_debug) {
       shot_prediction_debug->native = native_fire_prediction;
       shot_prediction_debug->aimer_end_ns = duration_cast<nanoseconds>(
@@ -1586,6 +1645,77 @@ int main(int argc, char * argv[])
     const bool native_prediction_trusted =
       native_prediction_valid && tracker_converged && yaw_motion_model_trusted;
     const double native_predicted_yaw = command.yaw;
+    auto_aim::FacePredictionResidual::Input residual_input;
+    residual_input.frame_ns = duration_cast<nanoseconds>(t.time_since_epoch()).count();
+    const auto & residual_td = tracker.frame_diagnostics();
+    const std::array<int, 3> residual_identity = targets.empty()
+      ? std::array<int, 3>{-1, -1, 0}
+      : std::array<int, 3>{static_cast<int>(targets.front().name),
+          static_cast<int>(targets.front().armor_type), targets.front().armor_num()};
+    residual_input.rebuilt = residual_td.initialized_this_frame || residual_td.nis_reset ||
+      residual_td.diverged || residual_identity != face_residual_identity;
+    if (residual_input.rebuilt) ++face_residual_epoch;
+    face_residual_identity = residual_identity;
+    residual_input.epoch = face_residual_epoch;
+    residual_input.high_speed_mode = high_speed_mode;
+    const double residual_frame_age_s = duration<double>(steady_clock::now() - t).count();
+    residual_input.context_valid = face_residual_config.enabled &&
+      xuc.enabled() && xuc.work_zone_ready() && xuc.control_ready() && xuc_imu_sync_valid &&
+      !targets.empty() && targets.front().armor_num() == 4 && tracker_converged &&
+      yaw_motion_model_trusted &&
+      high_speed_mode && !gyro_model_fresh &&
+      residual_frame_age_s >= 0.0 && residual_frame_age_s < work_zone_config.loss_hold_s;
+    residual_input.omega_rad_s = gyro_omega_rad_s;
+    if (!targets.empty()) {
+      const auto & state = targets.front().ekf().x;
+      if (state.size() == 11 && state.allFinite())
+        residual_input.center_range_m = std::hypot(state[0], state[2]);
+    }
+    residual_input.observations_valid = tracker.state() == "tracking" &&
+      tracker.primary_observation() != nullptr;
+    // Reject ambiguous duplicate face observations, even if one pose is finite.
+    if (residual_input.context_valid) {
+      std::array<int, 4> residual_face_counts{};
+      for (const auto & association : tracker.last_associations()) {
+        if (!association.used_for_update || !association.observation ||
+            association.face_id < 0 || association.face_id >= 4) continue;
+        const int face = association.face_id;
+        ++residual_face_counts[face];
+        const auto & armor = *association.observation;
+        if (valid_measurement_pose(armor))
+          residual_input.observations[face] = std::array<double, 2>{
+            armor.xyz_in_world[0], armor.xyz_in_world[1]};
+      }
+      for (int face = 0; face < 4; ++face)
+        if (residual_face_counts[face] != 1) residual_input.observations[face].reset();
+    }
+    residual_input.forecast_valid = native_prediction_trusted && native_fire_prediction.valid &&
+      native_fire_prediction.whole_ekf_geometry && aimer.debug_aim_point.valid;
+    residual_input.face = native_fire_prediction.face_id;
+    residual_input.prediction_ns = native_fire_prediction.prediction_ns;
+    if (aimer.debug_aim_point.valid)
+      residual_input.raw_yaw_rad = std::atan2(
+        aimer.debug_aim_point.xyza[1], aimer.debug_aim_point.xyza[0]);
+    residual_input.delay_s = native_fire_prediction.delay_s;
+    residual_input.speed_mps = native_fire_prediction.speed_mps;
+    if (residual_input.forecast_valid && !targets.empty()) {
+      const auto & state = targets.front().ekf().x;
+      const double dt = (residual_input.prediction_ns - residual_input.frame_ns) / 1e9;
+      if (state.size() == 11 && state.allFinite() && dt >= 0.0) {
+        residual_input.forecast_alignment_rad = std::remainder(
+          aimer.debug_aim_point.xyza[3] -
+            std::atan2(state[2] + state[3] * dt, state[0] + state[1] * dt), 2.0 * M_PI);
+      }
+    }
+    const auto face_residual = face_residual_monitor.update(residual_input);
+    // The existing centre-follow command and native geometry stay untouched.
+    // Only qualify the high-speed vehicle forecast with its bounded correction.
+    const double qualified_predicted_yaw = face_residual.correction_rad == 0.0
+      ? native_predicted_yaw
+      : std::remainder(native_predicted_yaw + face_residual.correction_rad, 2.0 * M_PI);
+    const bool face_correction_changed =
+      !auto_aim::FacePredictionResidual::same_model(face_residual, previous_face_residual);
+    previous_face_residual = face_residual;
     double gyro_predicted_impact_yaw_error_rad = INFINITY;
     bool gyro_predicted_impact_yaw_valid = false;
     bool gyro_event_schedule_valid = false;
@@ -1602,6 +1732,9 @@ int main(int argc, char * argv[])
     double gyro_event_face_alignment_rad = INFINITY;
     double gyro_event_gimbal_tracking_error_rad = INFINITY;
     std::chrono::steady_clock::time_point gyro_event_command_due_time{};
+    int64_t gyro_event_hit_ns = 0;
+    auto_aim::EventAimPrediction gyro_event_prediction;
+    double gyro_event_command_yaw_rad = NAN;
 
     // Phase 2D.5 integration guard.  The detector pose is much more stable
     // than the current high-dynamic EKF tuning at close range.  Keep the
@@ -1991,7 +2124,7 @@ int main(int argc, char * argv[])
               ? "vehicle_prediction" : "stationary_measurement");
       }
       const bool command_cadence_gate_open = !xuc.enabled() ||
-        (!xuc_pending_shot && xuc.shoot_request_ready());
+        (!xuc_pending_shot && xuc.shoot_request_ready(high_speed_mode));
       if (xuc.enabled() && !command_cadence_gate_open) {
         if (!xuc_gyro_cadence_hold_logged) {
           tools::logger()->info(
@@ -2004,12 +2137,11 @@ int main(int argc, char * argv[])
         xuc_gyro_cadence_hold_logged = false;
       }
       if (predictive_fire_active && native_prediction_valid) {
-        // native_predicted_yaw is produced from the same future AimPoint used by
-        // face_error_rad and already includes configured actuation delay plus the
+        // The raw prediction includes configured actuation delay plus the
         // iterated projectile flight time. Compare it with actual gimbal attitude,
         // not the centre-follow command, so servo lag is included in qualification.
         gyro_predicted_impact_yaw_error_rad = std::remainder(
-          native_predicted_yaw - ypr[0] - xuc_gyro_predicted_yaw_trim_rad,
+          qualified_predicted_yaw - ypr[0] - xuc_gyro_predicted_yaw_trim_rad,
           2.0 * M_PI);
         gyro_predicted_impact_yaw_valid =
           std::isfinite(gyro_predicted_impact_yaw_error_rad);
@@ -2132,59 +2264,48 @@ int main(int argc, char * argv[])
           gyro_event_command_due_time = std::chrono::steady_clock::time_point(
             std::chrono::duration_cast<std::chrono::steady_clock::duration>(
               std::chrono::duration<double>(event_solution.command_due_time_s)));
+          const auto impact_time = steady_clock::time_point(
+            duration_cast<steady_clock::duration>(duration<double>(event_solution.hit_time_s)));
+          gyro_event_hit_ns = duration_cast<nanoseconds>(impact_time.time_since_epoch()).count();
 
-          // Predict the complete rigid body to this exact impact event, then
-          // commit one physical face id.  The commitment is held for repeated
-          // frames of the same event cycle and hands over only at the next
-          // cycle (or if the prior face becomes geometrically impossible).
+          // Face, calibrated yaw residual and consecutive observations all
+          // belong to this absolute PLL impact event. Never add processing age
+          // again or qualify it with the separate 330 ms Aimer prediction.
+          gyro_predicted_impact_yaw_valid = false;
+          gyro_predicted_impact_yaw_error_rad = INFINITY;
           if (!targets.empty()) {
-            auto future_target = targets.front();
-            const double processing_age_s = std::max(
-              0.0, std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - t).count());
-            future_target.predict(
-              processing_age_s + event_solution.time_until_hit_center_s);
+            gyro_event_prediction = aimer.predict_event(
+              targets.front(), impact_time, gyro_face_selector, gyro_event_hit_cycle);
+            gyro_event_face_valid = gyro_event_prediction.valid;
+            gyro_event_face_id = gyro_event_prediction.face_id;
+            gyro_event_face_alignment_rad = gyro_event_prediction.alignment_rad;
             if (infantry_diagnostics_enabled && shot_prediction_debug) {
               shot_prediction_debug->event_prediction_horizon_s =
-                processing_age_s + event_solution.time_until_hit_center_s;
+                duration<double>(impact_time - t).count();
             }
-            const auto future_x = future_target.ekf_x();
-            if (future_x.size() >= 3) {
-              const double future_center_yaw = std::atan2(future_x[2], future_x[0]);
-              std::vector<auto_aim::GyroFaceSelector::Candidate> face_candidates;
-              const auto future_faces = future_target.armor_xyza_list();
-              face_candidates.reserve(future_faces.size());
-              for (std::size_t face_id = 0; face_id < future_faces.size(); ++face_id) {
-                face_candidates.push_back({
-                  static_cast<int>(face_id), future_faces[face_id][3]});
+            if (gyro_event_prediction.valid) {
+              // Compare in the same calibrated command frame as centre follow.
+              // Raw event geometry stays available for diagnostics; only this
+              // PLL qualification applies the existing boresight/impact trim.
+              gyro_event_command_yaw_rad = gyro_event_prediction.yaw_in_command_frame(
+                direct_yaw_command_correction_rad);
+              gyro_predicted_impact_yaw_error_rad = std::remainder(
+                gyro_event_command_yaw_rad - ypr[0] - xuc_gyro_predicted_yaw_trim_rad,
+                2.0 * M_PI);
+              gyro_predicted_impact_yaw_valid =
+                std::isfinite(gyro_predicted_impact_yaw_error_rad);
+              if (infantry_diagnostics_enabled && shot_prediction_debug)
+                std::copy_n(gyro_event_prediction.xyza.data(), 4,
+                  shot_prediction_debug->event_xyza.begin());
+              // Preserve the configured uncertainty/face-consistency policy.
+              gyro_event_combined_phase_rad = std::hypot(
+                event_solution.worst_interval_phase_rad, gyro_event_face_alignment_rad);
+              if (xuc_event_require_face_consistency) {
+                gyro_event_interval_safe =
+                  event_solution.worst_interval_phase_rad <= relaxed_half_window_rad &&
+                  gyro_event_combined_phase_rad <= relaxed_half_window_rad;
               }
-              const auto face_selection = gyro_face_selector.select(
-                face_candidates, future_center_yaw, gyro_event_hit_cycle);
-              gyro_event_face_valid = face_selection.valid;
-              gyro_event_face_id = face_selection.face_id;
-              gyro_event_face_alignment_rad = face_selection.alignment_rad;
-              if (infantry_diagnostics_enabled && shot_prediction_debug &&
-                  face_selection.valid && face_selection.face_id >= 0 &&
-                  static_cast<std::size_t>(face_selection.face_id) < future_faces.size()) {
-                const auto & face = future_faces[face_selection.face_id];
-                std::copy_n(face.data(), 4, shot_prediction_debug->event_xyza.begin());
-              }
-              if (face_selection.valid) {
-                // The temporal PLL interval and future-face alignment are
-                // partially independent error sources.  Root-sum-square keeps
-                // the face check meaningful without the excessive fire-rate
-                // loss caused by linearly adding two conservative bounds.
-                gyro_event_combined_phase_rad =
-                  std::hypot(
-                    event_solution.worst_interval_phase_rad,
-                    face_selection.alignment_rad);
-                if (xuc_event_require_face_consistency) {
-                  gyro_event_interval_safe =
-                    event_solution.worst_interval_phase_rad <= relaxed_half_window_rad &&
-                    gyro_event_combined_phase_rad <= relaxed_half_window_rad;
-                }
-              }
-              if (face_selection.valid && face_selection.changed) {
+              if (gyro_event_prediction.face_changed) {
                 tools::logger()->info(
                   "[FACELOCK] handoff cycle={} face={} alignment={:.2f}deg",
                   gyro_event_hit_cycle, gyro_event_face_id,
@@ -2251,7 +2372,7 @@ int main(int argc, char * argv[])
 
       // In event mode, issue only before the due instant and wait up to one
       // frame for a precise steady-clock send.  Never accept a late sample.
-      const bool gyro_yaw_gate_native_open = gyro_predicted_impact_yaw_valid &&
+      const bool prediction_yaw_gate_open = gyro_predicted_impact_yaw_valid &&
         direct_yaw_measurement_fresh &&
         std::abs(gyro_predicted_impact_yaw_error_rad) <=
           xuc_gyro_predicted_yaw_tolerance_rad &&
@@ -2259,6 +2380,7 @@ int main(int argc, char * argv[])
           xuc_gyro_visibility_yaw_tolerance_rad;
       const bool gyro_event_gate_open = gyro_event_schedule_valid &&
         gyro_phase_model_trusted && gyro_event_interval_safe &&
+        gyro_event_prediction.valid && prediction_yaw_gate_open &&
         (!xuc_event_require_face_consistency || gyro_event_face_valid) &&
         gyro_event_gimbal_tracking_error_rad <=
           xuc_event_gimbal_tracking_tolerance_rad &&
@@ -2268,9 +2390,9 @@ int main(int argc, char * argv[])
         ? (gyro_event_schedule_valid
              ? gyro_event_gate_open
              : (!xuc_gyro_require_event_lock_for_fire &&
-                gyro_yaw_gate_native_open))
+                prediction_yaw_gate_open))
         : (vehicle_predicted_fire_active
-             ? gyro_yaw_gate_native_open
+             ? prediction_yaw_gate_open
              : stationary_yaw_gate_open);
       const bool fire_candidate = !command.inhibit_shoot && command.control &&
         auto_mode_active &&
@@ -2291,7 +2413,8 @@ int main(int argc, char * argv[])
           "face={} face_ok={} face_align_deg={:.2f} phase_unc_deg={:.2f} "
           "gimbal_err_deg={:.2f} due_ms={:+.1f} window_deg={:.2f} "
           "worst_deg={:.2f} combined_deg={:.2f} "
-          "yawerr_deg={:.2f} pitcherr_deg={:.2f}",
+          "yawerr_deg={:.2f} pitcherr_deg={:.2f} "
+          "prediction_yaw={} impact_yaw_err_deg={:.2f} impact_ns={}",
           auto_mode_active ? 1 : 0, command.control ? 1 : 0,
           convergence_gate_open ? 1 : 0,
           one_face_gate_open ? 1 : 0, xuc_one_face_armed ? 1 : 0,
@@ -2310,7 +2433,9 @@ int main(int argc, char * argv[])
           gyro_event_worst_phase_rad * 180.0 / M_PI,
           gyro_event_combined_phase_rad * 180.0 / M_PI,
           direct_yaw_pixel_error_rad * 180.0 / M_PI,
-          direct_pitch_pixel_error_rad * 180.0 / M_PI);
+          direct_pitch_pixel_error_rad * 180.0 / M_PI,
+          prediction_yaw_gate_open ? 1 : 0,
+          gyro_predicted_impact_yaw_error_rad * 180.0 / M_PI, gyro_event_hit_ns);
       }
       const auto & fire_tracker_frame = tracker.frame_diagnostics();
       const bool prediction_observation_valid = predictive_fire_active &&
@@ -2318,8 +2443,9 @@ int main(int argc, char * argv[])
         tracker.primary_observation() != nullptr && convergence_gate_open &&
         direct_yaw_measurement_fresh && direct_pitch_measurement_fresh &&
         (!xuc.enabled() || xuc_imu_sync_valid) &&
-        native_prediction_valid && native_fire_prediction.valid &&
-        gyro_predicted_impact_yaw_valid && aimer.debug_aim_point.valid;
+        gyro_predicted_impact_yaw_valid &&
+        (gyro_event_schedule_valid ? gyro_event_prediction.valid :
+          (native_prediction_valid && native_fire_prediction.valid && aimer.debug_aim_point.valid));
       double selection_phase_rad = NAN, selection_omega_rad_s = NAN;
       if (prediction_observation_valid && !gyro_event_schedule_valid &&
           native_fire_prediction.whole_ekf_geometry && targets.front().armor_num() == 4) {
@@ -2337,27 +2463,32 @@ int main(int argc, char * argv[])
       rotation_fire_window.update(
         prediction_observation_valid,
         fire_tracker_frame.initialized_this_frame || fire_tracker_frame.nis_reset ||
-          fire_tracker_frame.diverged,
+          fire_tracker_frame.diverged || face_correction_changed,
         targets.empty() ? -1 : static_cast<int>(targets.front().name),
         targets.empty() ? -1 : static_cast<int>(targets.front().armor_type),
         targets.empty() ? 0 : targets.front().armor_num(),
-        native_fire_prediction.face_id,
-        gyro_event_face_valid,
-        !prediction_observation_valid ? NAN : (gyro_event_face_valid
-          ? static_cast<double>(gyro_event_face_id) * M_PI / 2.0
+        gyro_event_schedule_valid ? gyro_event_face_id : native_fire_prediction.face_id,
+        gyro_event_schedule_valid,
+        !prediction_observation_valid ? NAN : (gyro_event_schedule_valid
+          ? gyro_event_prediction.xyza[3]
           : aimer.debug_aim_point.xyza[3]),
         gyro_predicted_impact_yaw_error_rad, t, xuc_gyro_fire_min_consecutive_frames,
         xuc_gyro_candidate_max_phase_step_rad, xuc_gyro_predicted_yaw_tolerance_rad,
         camera_frame_count, selection_phase_rad, selection_omega_rad_s,
-        selection_coming_rad, selection_leaving_rad);
+        selection_coming_rad, selection_leaving_rad,
+        gyro_event_schedule_valid ? gyro_event_hit_cycle : -1);
+      // An event request already waits for its exact send instant. Comparing
+      // successive estimates for a geometric minimum would apply another clock.
+      const bool prediction_point_gate_open = gyro_event_schedule_valid ||
+        rotation_fire_window.current_frame_is_better ||
+        rotation_fire_window.exiting_selection_next_step;
       if (predictive_fire_active) {
         // The current gates and cadence apply only to this frame's request.
         // Qualification above keeps observing outside the angle window and
         // during the sender's hold/rearm interval. It never latches a request.
         stable_window_open = rotation_fire_window.two_frames_ready;
         command.shoot = stable_window_open && fire_candidate &&
-          gyro_yaw_gate_native_open && (rotation_fire_window.current_frame_is_better ||
-            rotation_fire_window.exiting_selection_next_step);
+          prediction_yaw_gate_open && prediction_point_gate_open;
         // Keep the stationary branch's dwell state separate from rotation.
         xuc_fire_candidate_active = false;
         xuc_fire_ready_logged = false;
@@ -2365,10 +2496,12 @@ int main(int argc, char * argv[])
         if (command.shoot) {
           tools::logger()->info(
             "[XUC][FIRE] rotation qualified frames={} face={} "
-            "predicted_impact_yaw_error_deg={:.2f} next_error_deg={:.2f}",
+            "predicted_impact_yaw_error_deg={:.2f} next_error_deg={:.2f} "
+            "event_cycle={} impact_ns={}",
             rotation_fire_window.frames, rotation_fire_window.face_id,
             gyro_predicted_impact_yaw_error_rad * 180.0 / M_PI,
-            rotation_fire_window.next_error_rad * 180.0 / M_PI);
+            rotation_fire_window.next_error_rad * 180.0 / M_PI,
+            gyro_event_hit_cycle, gyro_event_hit_ns);
           if (one_face_policy_active) {
             xuc_one_face_armed = false;
             if (gyro_event_schedule_valid) event_last_fired_cycle = gyro_event_hit_cycle;
@@ -2437,7 +2570,9 @@ int main(int argc, char * argv[])
           yaw_gate_open,
           std::abs(direct_pitch_pixel_error_rad) <= xuc_fire_pitch_tolerance_rad,
           one_face_gate_open, motion_transition_gate_open,
-          command_cadence_gate_open, stable_window_open};
+          command_cadence_gate_open, stable_window_open,
+          !predictive_fire_active || prediction_yaw_gate_open,
+          !predictive_fire_active || prediction_point_gate_open, !command.inhibit_shoot};
         fire_gate_snapshot_valid = true;
       }
     } else {
@@ -2670,12 +2805,15 @@ int main(int argc, char * argv[])
     // sample that was already late before this deliberate wait is discarded;
     // the small tolerance only covers OS wake-up jitter after sleep_until().
     double gyro_event_send_lateness_ms = NAN;
+    const bool fire_qualified_before_send = command.shoot;
+    const char * fire_send_blocker = nullptr;
     if (xuc.enabled() && command.shoot) {
       if (xuc.mode() != static_cast<uint8_t>(io::Mode::auto_aim)) {
         tools::logger()->warn(
           "[SHOT] request suppressed because lower-board mode={} is not AUTO",
           static_cast<int>(xuc.mode()));
         command.shoot = false;
+        fire_send_blocker = "lower_mode_changed";
       } else if (gyro_event_schedule_valid) {
         const auto wait_started = std::chrono::steady_clock::now();
         if (wait_started > gyro_event_command_due_time) {
@@ -2685,6 +2823,7 @@ int main(int argc, char * argv[])
             "[GYROSCHED] cycle={} missed before send by {:.2f} ms; shot discarded",
             gyro_event_hit_cycle, gyro_event_send_lateness_ms);
           command.shoot = false;
+          fire_send_blocker = "event_due_passed";
         } else {
           std::this_thread::sleep_until(gyro_event_command_due_time);
           const auto woke_at = std::chrono::steady_clock::now();
@@ -2696,6 +2835,7 @@ int main(int argc, char * argv[])
               "[GYROSCHED] cycle={} wake late by {:.2f} ms; shot discarded",
               gyro_event_hit_cycle, gyro_event_send_lateness_ms);
             command.shoot = false;
+            fire_send_blocker = "event_wake_late";
           }
         }
       }
@@ -2728,7 +2868,8 @@ int main(int argc, char * argv[])
         "period_ms={:.1f} window_deg={:.2f} worst_deg={:.2f} combined_deg={:.2f} "
         "face={} face_align_deg={:.2f} phase_unc_deg={:.2f} gimbal_err_deg={:.2f} "
         "imu_interp={} imu_extrap={} imu_alignment_ms={:+.1f} "
-        "imu_bracket_ms={:.2f} imu_nearest_offset_ms={:+.2f}",
+        "imu_bracket_ms={:.2f} imu_nearest_offset_ms={:+.2f} "
+        "high_speed={} shoot_low_ms={:.0f} min_request_interval_ms={:.0f}",
         shot_id, static_cast<int>(xuc.mode()), gyro_model_fresh ? 1 : 0,
         gyro_event_schedule_valid ? 1 : 0, gyro_event_hit_cycle,
         processing_age_ms, gyro_event_send_lateness_ms,
@@ -2742,7 +2883,9 @@ int main(int argc, char * argv[])
         gyro_event_gimbal_tracking_error_rad * 180.0 / M_PI,
         frame_imu.interpolated ? 1 : 0,
         frame_imu.extrapolated ? 1 : 0, xuc_imu_alignment_ms,
-        frame_imu.bracket_ms, frame_imu.nearest_offset_ms);
+        frame_imu.bracket_ms, frame_imu.nearest_offset_ms,
+        command.high_speed_shoot, xuc.shoot_low_ms(command.high_speed_shoot),
+        xuc.shoot_min_interval_ms(command.high_speed_shoot));
     }
 
     // 发送命令到 PlotJuggler（显示实际发送的值）
@@ -2840,6 +2983,12 @@ int main(int argc, char * argv[])
               {"image_timestamp_basis", "host_receive_with_configured_offset"},
               {"physical_exposure_center_ns", nullptr},
               {"motion_mode", auto_aim::RotationModelManager::name(rotation_model.mode)},
+              {"rotation_mode", auto_aim::RotationModelManager::name(rotation_model.motion_mode)},
+              {"shoot_low_ms", xuc.shoot_low_ms(command.high_speed_shoot)},
+              {"min_request_interval_ms", xuc.shoot_min_interval_ms(command.high_speed_shoot)},
+              {"yaw_eskf_enabled", yaw_eskf_enabled},
+              {"yaw_prediction_source", yaw_prediction_source},
+              {"yaw_model_trusted", yaw_motion_model_trusted},
               {"fire_branch", gyro_event_schedule_valid ? "high_speed_event" : debug.gate_branch},
               {"primary_observed_face", tracker.primary_face_id()},
               {"future_native_face_id", debug.native.valid
@@ -2859,6 +3008,10 @@ int main(int argc, char * argv[])
               {"event_prediction_horizon_s", number(debug.event_prediction_horizon_s)},
               {"event_flight_time_s", number(debug.event_flight_time_s)},
               {"event_delay_s", number(debug.event_delay_s)},
+              {"event_prediction_ns", gyro_event_hit_ns},
+              {"event_prediction_valid", gyro_event_prediction.valid},
+              {"event_predicted_yaw_rad", number(gyro_event_prediction.yaw_rad)},
+              {"event_command_yaw_rad", number(gyro_event_command_yaw_rad)},
               {"planned_send_ns", gyro_event_schedule_valid
                 ? nlohmann::json(duration_cast<nanoseconds>(
                     gyro_event_command_due_time.time_since_epoch()).count())
@@ -2887,6 +3040,12 @@ int main(int argc, char * argv[])
               {"omega_rad_s", number(gyro_omega_rad_s)},
               {"gate_reference_yaw_rad", number(ypr[0])},
               {"predicted_yaw_rad", number(native_predicted_yaw)},
+              {"qualified_predicted_yaw_rad", number(qualified_predicted_yaw)},
+              {"gate_predicted_yaw_rad", number(gyro_event_schedule_valid
+                ? gyro_event_command_yaw_rad : qualified_predicted_yaw)},
+              {"gate_yaw_command_correction_rad", gyro_event_schedule_valid
+                ? direct_yaw_command_correction_rad : 0.0},
+              {"face_residual_correction_rad", face_residual.correction_rad},
               {"predicted_yaw_trim_rad", xuc_gyro_predicted_yaw_trim_rad},
               {"predicted_yaw_error_rad", number(gyro_predicted_impact_yaw_error_rad)},
               {"predicted_yaw_tolerance_rad", xuc_gyro_predicted_yaw_tolerance_rad},
@@ -2972,7 +3131,9 @@ int main(int argc, char * argv[])
           shot_tx_ok ? shot_tx.yaw_raw * 180.0 / M_PI : NAN,
           shot_tx_ok ? shot_tx.pitch_raw * 180.0 / M_PI : NAN,
           xuc.feeder_speed_rpm(), xuc_pending_feeder_turns_at_request);
-        const int64_t tx_ns = xuc.last_shoot_tx_ns();
+        // Match the sender's minimum-interval origin: successful high write
+        // completion, rather than packet preparation or the earlier decision.
+        const int64_t tx_ns = shot_tx.complete_ns;
         if (shot_tx_ok && tx_ns > 0) {
           xuc_pending_shot_time = std::chrono::steady_clock::time_point(
             std::chrono::nanoseconds(tx_ns));
@@ -3069,11 +3230,52 @@ int main(int argc, char * argv[])
           {"aimer_call_begin_ns", debug.aimer_begin_ns}, {"aimer_call_end_ns", debug.aimer_end_ns},
           {"omega_rad_s", number(gyro_omega_rad_s)},
           {"motion_mode", auto_aim::RotationModelManager::name(rotation_model.mode)},
+          {"rotation_mode", auto_aim::RotationModelManager::name(rotation_model.motion_mode)},
+          {"shoot_low_ms", xuc.shoot_low_ms(command.high_speed_shoot)},
+          {"yaw_eskf_enabled", yaw_eskf_enabled},
+          {"yaw_prediction_source", yaw_prediction_source},
+          {"yaw_model_trusted", yaw_motion_model_trusted},
+          {"rotation_mode_trusted", rotation_model.tracker_trusted},
+          {"rotation_filtered_abs_rate_rad_s", number(rotation_model.filtered_abs_rate_rad_s)},
           {"fire_branch", gyro_event_schedule_valid ? "high_speed_event" : debug.gate_branch},
           {"request_id", issued_shot_id}, {"request_shoot", command.shoot},
+          {"fire_qualified_before_send", fire_qualified_before_send},
+          {"fire_send_blocker", fire_send_blocker
+            ? nlohmann::json(fire_send_blocker) : nlohmann::json(nullptr)},
+          {"event_send_lateness_ms", number(gyro_event_send_lateness_ms)},
+          {"gate_prediction_source", gyro_event_schedule_valid ? "pll_event" : "native_prediction"},
+          {"gate_prediction_ns", gyro_event_schedule_valid
+            ? gyro_event_hit_ns : native_fire_prediction.prediction_ns},
+          {"gate_face_id", gyro_event_schedule_valid
+            ? gyro_event_face_id : native_fire_prediction.face_id},
+          {"gate_predicted_yaw_rad", number(gyro_event_schedule_valid
+            ? gyro_event_command_yaw_rad : qualified_predicted_yaw)},
+          {"gate_yaw_command_correction_rad", gyro_event_schedule_valid
+            ? direct_yaw_command_correction_rad : 0.0},
+          {"event_prediction", {
+            {"valid", gyro_event_prediction.valid}, {"cycle", gyro_event_hit_cycle},
+            {"prediction_ns", gyro_event_hit_ns}, {"face_id", gyro_event_face_id},
+            {"yaw_rad", number(gyro_event_prediction.yaw_rad)},
+            {"command_yaw_rad", number(gyro_event_command_yaw_rad)},
+            {"yaw_command_correction_rad", direct_yaw_command_correction_rad},
+            {"delay_s", number(debug.event_delay_s)},
+            {"flight_time_s", number(debug.event_flight_time_s)},
+            {"due_in_ms", number(gyro_event_lead_error_s * 1000.0)},
+            {"planned_send_ns", gyro_event_schedule_valid
+              ? nlohmann::json(duration_cast<nanoseconds>(
+                  gyro_event_command_due_time.time_since_epoch()).count())
+              : nlohmann::json(nullptr)},
+            {"interval_safe", gyro_event_interval_safe},
+            {"phase_trusted", gyro_phase_model_trusted},
+            {"gimbal_tracking_error_rad", number(gyro_event_gimbal_tracking_error_rad)},
+            {"face_alignment_rad", number(gyro_event_face_alignment_rad)},
+            {"xyza", {number(gyro_event_prediction.xyza[0]), number(gyro_event_prediction.xyza[1]),
+              number(gyro_event_prediction.xyza[2]), number(gyro_event_prediction.xyza[3])}}}},
           {"gate_error_rad", number(gyro_predicted_impact_yaw_error_rad)},
           {"rotation_fire_window", {
             {"frames", rotation_fire_window.frames},
+            {"face_id", rotation_fire_window.face_id},
+            {"event_cycle", rotation_fire_window.hit_cycle},
             {"two_frames_ready", rotation_fire_window.two_frames_ready},
             {"current_frame_is_better", rotation_fire_window.current_frame_is_better},
             {"exiting_selection_next_step", rotation_fire_window.exiting_selection_next_step},
@@ -3081,6 +3283,34 @@ int main(int argc, char * argv[])
           {"gate_tolerance_rad", xuc_gyro_predicted_yaw_tolerance_rad},
           {"gate_reference_yaw_rad", number(ypr[0])},
           {"native_yaw_rad", number(native_predicted_yaw)},
+          {"qualified_predicted_yaw_rad", number(qualified_predicted_yaw)},
+          {"face_residual", {
+            {"enabled", face_residual_config.enabled}, {"eligible", face_residual.eligible},
+            {"phase_enabled", face_residual_config.phase_conditioned_enabled},
+            {"phase_conditioned", face_residual.phase_conditioned},
+            {"phase_cycles", face_residual.phase_cycles},
+            {"phase_bias_rad", number(face_residual.phase_bias_rad)},
+            {"phase_scatter_rad", number(face_residual.phase_scatter_rad)},
+            {"model_revision", face_residual.model_revision},
+            {"ready", face_residual.ready}, {"cycles", face_residual.cycles},
+            {"bias_rad", number(face_residual.bias_rad)},
+            {"scatter_rad", number(face_residual.scatter_rad)},
+            {"correction_rad", face_residual.correction_rad},
+            {"generation", face_residual.generation}, {"matched", face_residual.matched},
+            {"unmatched", face_residual.unmatched},
+            {"input", {
+              {"epoch", residual_input.epoch}, {"rebuilt", residual_input.rebuilt},
+              {"context_valid", residual_input.context_valid},
+              {"high_speed_mode", residual_input.high_speed_mode},
+              {"forecast_alignment_rad", number(residual_input.forecast_alignment_rad)},
+              {"observations_valid", residual_input.observations_valid},
+              {"omega_rad_s", number(residual_input.omega_rad_s)},
+              {"center_range_m", number(residual_input.center_range_m)},
+              {"forecast_valid", residual_input.forecast_valid}, {"face", residual_input.face},
+              {"prediction_ns", residual_input.prediction_ns},
+              {"raw_yaw_rad", number(residual_input.raw_yaw_rad)},
+              {"delay_s", number(residual_input.delay_s)},
+              {"speed_mps", number(residual_input.speed_mps)}}}}},
           {"output_yaw_rad", number(command.yaw)}, {"output_pitch_rad", number(command.pitch)},
           {"yaw_before_final_rate_rad", number(yaw_before_final_rate_rad)},
           {"yaw_after_final_rate_rad", number(yaw_after_final_rate_rad)},
@@ -3219,6 +3449,12 @@ int main(int argc, char * argv[])
           [](const auto & association) { return association.used_for_update; });
         trace["observations_total"] = observation_count;
         trace["observations_truncated"] = observation_count > evidence_limit;
+        trace["face_residual"]["input"]["observations"] = nlohmann::json::array();
+        for (const auto & xy : residual_input.observations) {
+          trace["face_residual"]["input"]["observations"].push_back(xy
+            ? nlohmann::json::array({number((*xy)[0]), number((*xy)[1])})
+            : nlohmann::json(nullptr));
+        }
         trace["capture_us"] = duration<double, std::micro>(steady_clock::now() - capture_begin).count();
         xuc.record_shot_debug(std::move(trace));
       } catch (...) {
@@ -3495,6 +3731,9 @@ int main(int argc, char * argv[])
         trace["tracker_whole_nis"] = finite_value(tracker_frame_diagnostics.whole_nis);
         trace["tracker_whole_nees"] = finite_value(tracker_frame_diagnostics.whole_nees);
         trace["tracker_yaw_eskf_trusted"] = tracker_frame_diagnostics.yaw_eskf_trusted;
+        trace["yaw_eskf_enabled"] = tracker_frame_diagnostics.yaw_eskf_enabled;
+        trace["yaw_model_trusted"] = tracker_frame_diagnostics.yaw_model_trusted;
+        trace["yaw_prediction_source"] = tracker_frame_diagnostics.yaw_model_source;
         trace["tracker_yaw_eskf_angle_deg"] =
           finite_value(tracker_frame_diagnostics.yaw_eskf_angle * RAD2DEG);
         trace["tracker_yaw_eskf_rate_rad_s"] =
@@ -3559,6 +3798,9 @@ int main(int argc, char * argv[])
         trace["fire_first_blocker"] = fire_gate_snapshot_valid && fire_first_blocker >= 0
           ? nlohmann::json(fire_gate_names[static_cast<std::size_t>(fire_first_blocker)])
           : nlohmann::json(nullptr);
+        trace["fire_qualified_before_send"] = fire_qualified_before_send;
+        trace["fire_send_blocker"] = fire_send_blocker
+          ? nlohmann::json(fire_send_blocker) : nlohmann::json(nullptr);
         if (fire_gate_snapshot_valid) {
           nlohmann::json gates;
           for (std::size_t gate = 0; gate < fire_gate_names.size(); ++gate) {

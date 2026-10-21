@@ -122,6 +122,78 @@ int main()
   assert(result.mode == Manager::Mode::armor && !result.tracker_trusted);
   assert(!result.phase_reset && !result.phase_fire_trusted);
 
+  // Motion classification remains three-state with the PLL disabled. Legacy
+  // low-speed prediction stays vehicle; high speed does not enable the PLL.
+  using Motion = Manager::MotionMode;
+  for (double sign : {-1.0, 1.0}) {
+    Manager::Config cfg;
+    cfg.high_speed_phase_enabled = false;
+    cfg.vehicle_exit_rad_s = 0.45;
+    cfg.mode_dwell_s = 0.6;
+    cfg.tracker_dropout_hold_s = 0.25;
+    Manager three(cfg);
+    assert(three.update(0.0, true, 0.0).motion_mode == Motion::stationary);
+    assert(three.update(0.1, true, sign * 1.5).motion_mode == Motion::stationary);
+    result = three.update(0.71, true, sign * 1.5);
+    assert(result.motion_mode == Motion::low_speed && result.motion_mode_changed);
+    assert(result.mode == Manager::Mode::vehicle);
+    three.update(0.8, true, sign * 4.5);
+    result = three.update(1.41, true, sign * 4.5);
+    assert(result.motion_mode == Motion::high_speed && result.motion_mode_changed);
+    assert(result.mode == Manager::Mode::vehicle && !result.mode_changed);
+    assert(!result.phase_reset && !result.phase_fire_trusted);
+    // Both hysteresis bands retain their current mode, even for long periods.
+    result = three.update(2.2, true, sign * 2.8, true, 2.8);
+    assert(result.motion_mode == Motion::high_speed && !result.phase_fire_trusted);
+    three.update(2.3, true, sign * 2.4);
+    result = three.update(2.91, true, sign * 2.4);
+    assert(result.motion_mode == Motion::low_speed);
+    assert(three.update(3.6, true, sign * 0.6).motion_mode == Motion::low_speed);
+    three.update(3.7, true, 0.0);
+    assert(three.update(4.31, true, 0.0).motion_mode == Motion::stationary);
+    // A brief excursion above 3.2 cannot enter high speed.
+    three.update(4.4, true, sign * 4.5);
+    assert(three.update(4.6, true, sign * 1.5).motion_mode == Motion::stationary);
+    assert(three.update(5.21, true, sign * 1.5).motion_mode == Motion::low_speed);
+    // Lost observations cannot complete the high-speed dwell.
+    three.update(5.3, true, sign * 4.5);
+    result = three.update(5.4, false, 0.0);
+    assert(result.motion_mode == Motion::low_speed && !result.tracker_trusted);
+    assert(three.update(5.5, true, sign * 4.5).motion_mode == Motion::low_speed);
+    assert(three.update(6.11, true, sign * 4.5).motion_mode == Motion::high_speed);
+    result = three.update(6.12, false, 0.0);
+    assert(result.motion_mode == Motion::high_speed && !result.tracker_trusted);
+    result = three.update(6.5, false, 0.0);
+    assert(result.motion_mode == Motion::stationary && !result.tracker_trusted);
+    three.update(6.6, true, sign * 4.5);
+    result = three.update(7.21, true, sign * 4.5);
+    assert(result.motion_mode == Motion::high_speed);
+    assert(!three.update(7.21, true, sign * 4.5).tracker_trusted); // Duplicate frame.
+    assert(three.motion_mode() == Motion::stationary);
+    assert(!three.update(NAN, true, sign * 4.5).tracker_trusted);
+  }
+  for (int bad = 0; bad < 4; ++bad) {
+    Manager::Config cfg;
+    if (bad == 0) cfg.vehicle_exit_rad_s = cfg.vehicle_enter_rad_s;
+    if (bad == 1) cfg.high_speed_exit_rad_s = cfg.vehicle_enter_rad_s;
+    if (bad == 2) cfg.high_speed_enter_rad_s = cfg.high_speed_exit_rad_s;
+    if (bad == 3) cfg.rate_filter_tau_s = NAN;
+    bool rejected = false;
+    try { Manager invalid(cfg); } catch (const std::invalid_argument &) { rejected = true; }
+    assert(rejected);
+  }
+  {
+    Manager::Config cfg;
+    cfg.high_speed_phase_enabled = false;
+    cfg.mode_dwell_s = 0.6;
+    cfg.rate_filter_tau_s = 0.1;
+    Manager boundary(cfg);
+    for (int i = 0; i < 160; ++i) {
+      result = boundary.update(i * 0.02, true, i % 2 ? 3.3 : 3.1);
+      if (i >= 32) assert(result.motion_mode == Motion::low_speed);
+      assert(!result.phase_fire_trusted);
+    }
+  }
   std::cout << "rotation_model_manager_test: PASS\n";
   return 0;
 }

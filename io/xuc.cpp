@@ -162,11 +162,24 @@ XucSender::XucSender(const std::string & config_path)
       yaml["xuc_shoot_low_ms"].as<double>(), 50.0, 2000.0);
     shoot_low_duration_ns_ = static_cast<int64_t>(low_ms * 1.0e6);
   }
+  high_speed_shoot_low_duration_ns_ = shoot_low_duration_ns_;
+  if (yaml["xuc_high_speed_shoot_low_ms"]) {
+    const double low_ms = std::clamp(
+      yaml["xuc_high_speed_shoot_low_ms"].as<double>(), 50.0, 2000.0);
+    high_speed_shoot_low_duration_ns_ = static_cast<int64_t>(low_ms * 1.0e6);
+  }
   if (yaml["xuc_shot_rearm_ms"]) {
     // Zero disables the extra minimum interval; high/low release still applies.
     const double interval_ms = std::clamp(
       yaml["xuc_shot_rearm_ms"].as<double>(), 0.0, 2000.0);
     shoot_min_interval_ns_ = static_cast<int64_t>(interval_ms * 1.0e6);
+  }
+  // Missing profile key preserves the legacy shared interval.
+  high_speed_shoot_min_interval_ns_ = shoot_min_interval_ns_;
+  if (yaml["xuc_high_speed_shot_rearm_ms"]) {
+    const double interval_ms = std::clamp(
+      yaml["xuc_high_speed_shot_rearm_ms"].as<double>(), 0.0, 2000.0);
+    high_speed_shoot_min_interval_ns_ = static_cast<int64_t>(interval_ms * 1.0e6);
   }
 
   try {
@@ -194,12 +207,14 @@ XucSender::XucSender(const std::string & config_path)
       "[XUC] serial opened {} @ {} baud, angles=rad, yaw_sign={}, pitch_sign={}, "
       "imu_yaw_sign={}, imu_pitch_sign={}, allow_control={}, allow_shoot={}, "
       "require_feedback={}, require_auto_mode={}, max_yaw_excursion_deg={:.2f}, "
-      "lock_pitch={}, shoot=single_packet, shoot_low_ms={:.0f}, min_request_interval_ms={:.0f}, heartbeat_hz={:.1f}",
+      "lock_pitch={}, shoot=single_packet, shoot_low_ms={:.0f}, high_speed_shoot_low_ms={:.0f}, min_request_interval_ms={:.0f}, high_speed_min_request_interval_ms={:.0f}, heartbeat_hz={:.1f}",
       port, baud, yaw_sign_, pitch_sign_, imu_yaw_sign_, imu_pitch_sign_, allow_control_,
       allow_shoot_, require_feedback_for_control_, require_auto_mode_for_control_,
       max_yaw_excursion_rad_ * 180.0 / M_PI, lock_pitch_for_control_,
       static_cast<double>(shoot_low_duration_ns_) / 1.0e6,
+      static_cast<double>(high_speed_shoot_low_duration_ns_) / 1.0e6,
       static_cast<double>(shoot_min_interval_ns_) / 1.0e6,
+      static_cast<double>(high_speed_shoot_min_interval_ns_) / 1.0e6,
       heartbeat_period_ns_ > 0 ? 1e9 / heartbeat_period_ns_ : 0.0);
     if (!allow_control_) {
       tools::logger()->warn("[XUC][SAFE] control output is forced to zero");
@@ -345,20 +360,23 @@ bool XucSender::imu_at(
   return true;
 }
 
-bool XucSender::shoot_request_ready_at(int64_t now_ns) const
+bool XucSender::shoot_request_ready_at(int64_t now_ns, bool high_speed) const
 {
+  const int64_t interval_ns = high_speed
+    ? high_speed_shoot_min_interval_ns_ : shoot_min_interval_ns_;
   return enabled_ && serial_.isOpen() && allow_shoot_ && control_ready() && !return_requested_ &&
     !shoot_low_pending_ &&
     (shoot_low_until_ns_ == 0 || now_ns >= shoot_low_until_ns_) &&
-    now_ns >= shoot_next_request_ns_;
+    (last_shot_transmission_.complete_ns == 0 ||
+      now_ns - last_shot_transmission_.complete_ns >= interval_ns);
 }
 
-bool XucSender::shoot_request_ready() const
+bool XucSender::shoot_request_ready(bool high_speed) const
 {
   std::lock_guard<std::mutex> lock(send_mutex_);
   const auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
     std::chrono::steady_clock::now().time_since_epoch()).count();
-  return shoot_request_ready_at(now_ns);
+  return shoot_request_ready_at(now_ns, high_speed);
 }
 
 void XucSender::note_shot_debug_drop() noexcept
@@ -434,6 +452,7 @@ bool XucSender::send_debug_locked(const Command & cmd, const XucShotDebugContext
         {"first_high_write_complete_ns", debug.first_high_complete_ns > 0 ? nlohmann::json(debug.first_high_complete_ns) : nlohmann::json(nullptr)},
         {"low_interval_begin_ns", first_low ? nlohmann::json(last_tx_complete_ns()) : nlohmann::json(nullptr)},
         {"low_interval_until_ns", first_low ? nlohmann::json(shoot_low_until_ns_) : nlohmann::json(nullptr)},
+        {"low_duration_ms", static_cast<double>(active_shoot_low_duration_ns_) / 1.0e6},
         {"projectile_exit", "unknown"}, {"timestamp_basis", "host_steady_clock"}};
       debug.push(std::move(record));
     } catch (...) {
@@ -505,11 +524,17 @@ bool XucSender::send_locked(const Command & cmd)
   const bool control_requested = !return_requested_ && link_ready && cmd.control && fresh && finite_angles;
   pkt.control = return_requested_ ? 2 : (control_requested ? 1 : 0);
   const bool new_shoot_request = control_requested && cmd.shoot && !cmd.inhibit_shoot &&
-    shoot_request_ready_at(now_ns);
+    shoot_request_ready_at(now_ns, cmd.high_speed_shoot);
   pkt.shoot = new_shoot_request ? 1 : 0;
   // Even a failed/short high write may have reached the MCU. Require a confirmed
   // low packet before another request; never retry a stale high automatically.
-  if (new_shoot_request) shoot_low_pending_ = true;
+  if (new_shoot_request) {
+    // Capture this request's profile before attempting the high write. A mode
+    // change, failed write or heartbeat must not shorten/extend its release.
+    active_shoot_low_duration_ns_ = cmd.high_speed_shoot
+      ? high_speed_shoot_low_duration_ns_ : shoot_low_duration_ns_;
+    shoot_low_pending_ = true;
+  }
   if (!control_requested) target_yaw_raw = target_pitch_raw = 0.0;
   const bool bounded_session =
     max_yaw_excursion_rad_ > 0.0 || lock_pitch_for_control_;
@@ -559,7 +584,6 @@ bool XucSender::send_locked(const Command & cmd)
       const auto write_complete_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
       if (pkt.shoot == 1) {
-        shoot_next_request_ns_ = write_complete_ns + shoot_min_interval_ns_;
         last_shot_transmission_ = {now_ns, write_complete_ns, pkt.yaw, pkt.pitch};
         last_shoot_tx_ns_.store(now_ns, std::memory_order_release);
         tools::logger()->info(
@@ -567,10 +591,10 @@ bool XucSender::send_locked(const Command & cmd)
       }
       if (shoot_low_pending_ && pkt.shoot == 0) {
         shoot_low_pending_ = false;
-        shoot_low_until_ns_ = write_complete_ns + shoot_low_duration_ns_;
+        shoot_low_until_ns_ = write_complete_ns + active_shoot_low_duration_ns_;
         tools::logger()->info(
           "[XUC][TX] shoot=0 low_ms={:.0f} control={}",
-          static_cast<double>(shoot_low_duration_ns_) / 1.0e6,
+          static_cast<double>(active_shoot_low_duration_ns_) / 1.0e6,
           static_cast<int>(pkt.control));
       }
       last_tx_yaw_raw_.store(pkt.yaw, std::memory_order_relaxed);

@@ -102,3 +102,4 @@ Thumbs.db
 /scripts/package_runtime.py
 /scripts/restore_runtime.py
 /tests/test_runtime_recovery.py
+/firmware/infantry/tools/backup_stm32f405_flash.ps1

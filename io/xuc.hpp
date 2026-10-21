@@ -120,9 +120,9 @@ public:
   bool shot_debug_enabled() const { return shot_debug_ != nullptr; }
   void record_shot_debug(nlohmann::json && snapshot) noexcept;
   void note_shot_debug_drop() noexcept;
-  // Called on the sending thread. Qualification waits for both the wire-level
-  // release interval and the deadline retained across feedback/mode dropouts.
-  bool shoot_request_ready() const;
+  // Evaluate the CURRENT request's mode; the previous request's wire release
+  // still applies, but a high-speed interval must not throttle a low-speed one.
+  bool shoot_request_ready(bool high_speed = false) const;
   bool control_ready() const
   {
     return allow_control_ && (!require_feedback_for_control_ || rx_valid()) &&
@@ -164,13 +164,15 @@ public:
   {
     return last_tx_shoot_.load(std::memory_order_relaxed);
   }
-  double shoot_low_ms() const
+  double shoot_low_ms(bool high_speed = false) const
   {
-    return static_cast<double>(shoot_low_duration_ns_) / 1.0e6;
+    return static_cast<double>(high_speed
+      ? high_speed_shoot_low_duration_ns_ : shoot_low_duration_ns_) / 1.0e6;
   }
-  double shoot_min_interval_ms() const
+  double shoot_min_interval_ms(bool high_speed = false) const
   {
-    return static_cast<double>(shoot_min_interval_ns_) / 1.0e6;
+    return static_cast<double>(high_speed
+      ? high_speed_shoot_min_interval_ns_ : shoot_min_interval_ns_) / 1.0e6;
   }
   uint8_t mode() const { return mode_.load(std::memory_order_relaxed); }
   uint8_t robot_id() const { return robot_id_.load(std::memory_order_relaxed); }
@@ -259,7 +261,7 @@ private:
   void cache_command_locked(const Command & cmd);
   bool send_locked(const Command & cmd);
   bool send_debug_locked(const Command & cmd, const XucShotDebugContext * request);
-  bool shoot_request_ready_at(int64_t now_ns) const;
+  bool shoot_request_ready_at(int64_t now_ns, bool high_speed = false) const;
 
   serial::Serial serial_;
   bool enabled_ = false;
@@ -279,9 +281,11 @@ private:
   bool control_session_active_ = false;
   double control_yaw_anchor_raw_ = 0.0;
   int64_t shoot_low_duration_ns_ = 50000000;
+  int64_t high_speed_shoot_low_duration_ns_ = 50000000;
+  int64_t active_shoot_low_duration_ns_ = 50000000;
   int64_t shoot_min_interval_ns_ = 0;
+  int64_t high_speed_shoot_min_interval_ns_ = 0;
   int64_t shoot_low_until_ns_ = 0;
-  int64_t shoot_next_request_ns_ = 0;
   bool shoot_low_pending_ = false;
   bool return_requested_ = false;
   mutable std::mutex send_mutex_;

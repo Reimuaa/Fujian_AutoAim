@@ -81,6 +81,9 @@ Tracker::Tracker(const std::string & config_path, Solver & solver)
       yaml["tracker_gyro_center_acceleration_variance"].as<double>(),
       0.01, center_process_config_.acceleration_variance);
   }
+  if (yaml["yaw_eskf_enabled"]) yaw_eskf_config_.enabled = yaml["yaw_eskf_enabled"].as<bool>();
+  tools::logger()->info("[Tracker] yaw_eskf_enabled={} prediction_source={}",
+    yaw_eskf_config_.enabled, yaw_eskf_config_.enabled ? "yaw_eskf" : "whole_ekf");
   if (yaml["yaw_eskf_angular_jerk_variance"]) {
     yaw_eskf_config_.angular_jerk_variance = std::clamp(
       yaml["yaw_eskf_angular_jerk_variance"].as<double>(), 0.1, 5000.0);
@@ -166,6 +169,9 @@ void Tracker::capture_frame_diagnostics()
   const auto nees = ekf.data.find("nees");
   frame_diagnostics_.whole_nees = nees != ekf.data.end()
     ? nees->second : std::numeric_limits<double>::quiet_NaN();
+  frame_diagnostics_.yaw_eskf_enabled = target_.yaw_eskf_enabled();
+  frame_diagnostics_.yaw_model_trusted = target_.yaw_model_trusted();
+  frame_diagnostics_.yaw_model_source = target_.yaw_model_source();
   frame_diagnostics_.yaw_eskf_trusted = target_.yaw_eskf_trusted();
   frame_diagnostics_.yaw_eskf_angle = target_.yaw_eskf_angle();
   frame_diagnostics_.yaw_eskf_rate = target_.yaw_eskf_rate();
@@ -181,6 +187,7 @@ std::list<Target> Tracker::track(
   std::list<Armor> & armors, std::chrono::steady_clock::time_point t, bool use_enemy_color)
 {
   frame_diagnostics_ = FrameDiagnostics{};
+  frame_diagnostics_.yaw_eskf_enabled = yaw_eskf_config_.enabled;
   last_associations_.clear();
   primary_detection_index_ = -1;
   primary_face_id_ = -1;
@@ -744,10 +751,10 @@ bool Tracker::update_target(std::list<Armor> & armors, std::chrono::steady_clock
   // motion, where two simultaneously visible faces materially improve the
   // rigid-body centre, radius and phase estimate.
   // Never let an association-induced rate spike enable the more aggressive
-  // multi-face update.  It is useful only after the independent yaw ESKF has
-  // both converged and passed its configured physical rate/acceleration bounds.
-  const bool use_batch = target_.yaw_eskf_trusted() &&
-    std::abs(target_.yaw_eskf_rate()) >= batch_min_omega_rad_s_;
+  // multi-face update. The selected yaw model must pass its own warm-up,
+  // covariance and physical bounds, including in the EKF-only trial.
+  const bool use_batch = target_.yaw_model_trusted() &&
+    std::abs(target_.ekf_x()[7]) >= batch_min_omega_rad_s_;
   std::vector<std::pair<Armor, int>> batch;
   batch.reserve(use_batch ? selected.size() : 1);
   for (const auto & association : selected) {

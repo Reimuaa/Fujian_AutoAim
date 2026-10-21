@@ -27,6 +27,7 @@ public:
     double max_trusted_abs_rate_rad_s = std::numeric_limits<double>::infinity();
     double max_trusted_abs_acceleration_rad_s2 =
       std::numeric_limits<double>::infinity();
+    bool enabled = true;
   };
 
   struct UpdateResult
@@ -41,6 +42,7 @@ public:
 
   void reset(double measured_yaw_rad, double initial_rate_rad_s = 0.0)
   {
+    if (!config_.enabled) return;
     x_ << measured_yaw_rad, initial_rate_rad_s, 0.0;
     P_.setZero();
     P_(0, 0) = std::pow(30.0 * M_PI / 180.0, 2);
@@ -55,7 +57,7 @@ public:
 
   void predict(double dt_s)
   {
-    if (!initialized_ || !std::isfinite(dt_s) || dt_s <= 0.0) return;
+    if (!config_.enabled || !initialized_ || !std::isfinite(dt_s) || dt_s <= 0.0) return;
     const double max_step_s = std::max(1e-3, config_.max_dt_s);
     const double requested_steps = std::ceil(dt_s / max_step_s);
     // An abnormal stale timestamp must not block the sending thread or silently
@@ -94,6 +96,7 @@ public:
   UpdateResult update(double measured_body_yaw_rad, double measurement_variance)
   {
     UpdateResult out;
+    if (!config_.enabled) return out;
     if (!std::isfinite(measured_body_yaw_rad)) return out;
     if (!initialized_) {
       reset(measured_body_yaw_rad);
@@ -145,6 +148,7 @@ public:
     double measured_body_yaw_rad, double measurement_variance,
     double equivalence_period_rad)
   {
+    if (!config_.enabled) return UpdateResult{};
     // With identical faces an early association error can select the wrong
     // periodic branch and drive the constant-acceleration state to hundreds of
     // rad/s while still producing a small wrapped innovation.  Recover at the
@@ -170,10 +174,11 @@ public:
     return out;
   }
 
+  bool enabled() const { return config_.enabled; }
   bool initialized() const { return initialized_; }
   bool trusted() const
   {
-    return initialized_ &&
+    return config_.enabled && initialized_ &&
       accepted_updates_ >= std::max(1, config_.min_trusted_updates) &&
       std::isfinite(P_(1, 1)) &&
       P_(1, 1) <= std::max(1e-6, config_.trusted_rate_variance) &&

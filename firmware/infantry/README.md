@@ -113,7 +113,7 @@ openocd -f interface/cmsis-dap.cfg `
 
 若使用已安装的STM32CubeProgrammer和ST-Link，选择SWD，加载对应HEX/ELF；BIN需设与链接布局一致的`0x08000000`。不盲目执行读保护解除、Option Bytes或解锁来解决连接问题。
 
-已有`tools/backup_stm32f405_flash.ps1`会reset/halt并生成日期后缀镜像，是历史脚本；当前不创建备份副本的约定下不自动运行。读Flash也会扰动运行，需另行安排。
+固件备份脚本不纳入源码分支，不随工程上传。读Flash会reset/halt并扰动运行，需另行安排。
 
 命令语义见[OpenOCD官方烧录文档](https://openocd.org/doc/html/Flash-Programming.html)，探针选项见[官方适配器配置](https://openocd.org/doc/html/Debug-Adapter-Configuration.html)。
 

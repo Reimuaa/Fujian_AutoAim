@@ -15,6 +15,7 @@ struct Command
   bool inhibit_shoot = false;
   bool request_return = false;  // XUC: explicit control_TJ=2, latched by the sender.
   int64_t target_valid_until_ns = 0; // Steady clock; zero uses the sender's bounded freshness lease.
+  bool high_speed_shoot = false; // XUC cadence profile; host-only, never serialized.
 };
 
 }  // namespace io
