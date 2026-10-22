@@ -20,7 +20,8 @@
 
 namespace auto_aim
 {
-Tracker::Tracker(const std::string & config_path, Solver & solver)
+Tracker::Tracker(
+  const std::string & config_path, Solver & solver, std::optional<bool> yaw_eskf_override)
 : solver_{solver},
   detect_count_(0),
   temp_lost_count_(0),
@@ -82,6 +83,7 @@ Tracker::Tracker(const std::string & config_path, Solver & solver)
       0.01, center_process_config_.acceleration_variance);
   }
   if (yaml["yaw_eskf_enabled"]) yaw_eskf_config_.enabled = yaml["yaw_eskf_enabled"].as<bool>();
+  if (yaw_eskf_override) yaw_eskf_config_.enabled = *yaw_eskf_override;
   tools::logger()->info("[Tracker] yaw_eskf_enabled={} prediction_source={}",
     yaw_eskf_config_.enabled, yaw_eskf_config_.enabled ? "yaw_eskf" : "whole_ekf");
   if (yaml["yaw_eskf_angular_jerk_variance"]) {

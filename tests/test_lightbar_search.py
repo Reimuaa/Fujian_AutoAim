@@ -79,6 +79,275 @@ def compile_run(code, name, *, sources=(), libraries=(), fixtures=None, argument
 
 
 class LightbarSearchTests(unittest.TestCase):
+    def test_camera_first_pending_latest_switch_and_pairing(self):
+        source = (ROOT / "io/hikrobot/hikrobot.cpp").read_text(encoding="utf-8")
+        begin = source.index("void HikRobot::read(")
+        reads = source[begin:source.index("void HikRobot::capture_start()", begin)]
+        standard = (ROOT / "src/standard.cpp").read_text(encoding="utf-8")
+        begin = standard.index("    const bool camera_latest_requested =")
+        selection = standard[begin:standard.index("    const auto camera_read_at", begin)]
+        self.assertIn("high_speed_camera_mode = high_speed_mode;", standard)
+        self.assertIn("++capture_sequence_, raw.stFrameInfo.nFrameNum", source)
+        self.assertIn("timestamp = data.timestamp;", reads)
+        compile_run(r'''
+#include <cassert>
+#include <cmath>
+#include <future>
+#include <iostream>
+#include <memory>
+#include <thread>
+#include "io/camera.hpp"
+#include "tools/thread_safe_queue.hpp"
+using namespace std::chrono;
+using namespace std::chrono_literals;
+struct Frame { int seq; int64_t ns; double yaw; std::shared_ptr<int> payload; };
+Frame frame(int seq) { return {seq, seq*6666667LL, seq*.001, std::make_shared<int>(seq)}; }
+void paired(const Frame & f) {
+  assert(f.ns==f.seq*6666667LL && f.yaw==f.seq*.001 && *f.payload==f.seq);
+}
+namespace io {
+// Only the production read methods are used. No constructor, SDK or hardware.
+class HikRobot : public CameraBase {
+public:
+  struct CameraData { cv::Mat img; steady_clock::time_point timestamp;
+    uint64_t capture_sequence; uint64_t sdk_frame_id; };
+  tools::CameraFrameQueue<CameraData> queue_;
+  CameraFrameInfo last_frame_info_;
+  void read(cv::Mat &,steady_clock::time_point &) override;
+  void read_latest(cv::Mat &,steady_clock::time_point &) override;
+  void read_frame(cv::Mat &,steady_clock::time_point &,bool);
+  CameraFrameInfo frame_info() const override { return last_frame_info_; }
+};
+READS
+struct Fallback : CameraBase {
+  int reads=0;
+  void read(cv::Mat &,steady_clock::time_point & t) override {
+    ++reads; t=steady_clock::time_point(99ms);
+  }
+};
+}
+int main() {
+  tools::CameraFrameQueue<Frame> q;
+  q.push(frame(1)); q.push(frame(2)); q.push(frame(3));
+  assert(q.pop(false).seq==1); // Exact old single-slot semantics at low speed.
+  q.push(frame(4)); q.push(frame(5)); q.push(frame(6));
+  auto f=q.pop(true); paired(f); assert(f.seq==6); // Enter high: producer kept it.
+  q.push(frame(7)); q.push(frame(8));
+  f=q.pop(false); paired(f); assert(f.seq==7); // Exit high: never replay 4 or 5.
+  q.push(frame(9)); q.push(frame(10));
+  assert(q.pop(true).seq==10); // Re-enter high with pending backlog.
+  std::weak_ptr<int> first, obsolete;
+  { auto a=frame(11); first=a.payload; q.push(a);
+    auto b=frame(12); obsolete=b.payload; q.push(b); }
+  q.push(frame(13)); assert(!first.expired() && obsolete.expired());
+  { auto last=q.pop(true); assert(last.seq==13); }
+  assert(first.expired()); // Only the first and newest frame can be retained.
+  auto waiting=std::async(std::launch::async,[&] { return q.pop(true); });
+  assert(waiting.wait_for(10ms)==std::future_status::timeout); // Camera pause, no stale replay.
+  q.push(frame(14)); f=waiting.get(); paired(f); assert(f.seq==14);
+  // Deterministic 150Hz production / ~58Hz consumption. Compare low policy
+  // frame-for-frame with the actual old queue, not with a second algorithm.
+  tools::CameraFrameQueue<Frame> mixed;
+  tools::ThreadSafeQueue<Frame> legacy(1);
+  int next=1, previous=0; double first_age=0,latest_age=0; int samples=0;
+  tools::CameraFrameQueue<Frame> high;
+  for(int step=1;step<=580;++step) {
+    const int64_t read_ns=step*17241379LL;
+    while(next*6666667LL<=read_ns) {
+      auto value=frame(next++); mixed.push(value); legacy.push(value); high.push(value);
+    }
+    auto low=mixed.pop(false); auto old=legacy.pop(); auto fresh=high.pop(true);
+    paired(low); paired(fresh); assert(low.seq==old.seq && low.seq>previous);
+    assert(fresh.seq>=low.seq && read_ns>=fresh.ns);
+    previous=low.seq; first_age+=(read_ns-low.ns)/1e6; latest_age+=(read_ns-fresh.ns)/1e6; ++samples;
+  }
+  assert(latest_age<first_age);
+  std::thread producer([&] { for(int i=15;i<=30000;++i) q.push(frame(i)); });
+  int seq=14;
+  while(seq<30000) { f=q.pop(true); paired(f); assert(f.seq>seq); seq=f.seq; }
+  producer.join();
+  io::HikRobot camera; cv::Mat img; steady_clock::time_point t;
+  struct { bool enabled() const { return true; } } xuc;
+  bool xuc_high_speed_latest_frame_enabled=true,high_speed_camera_mode=false;
+  for(int mode=0;mode<5;++mode) {
+    high_speed_camera_mode=(mode==1 || mode==3 || mode==4);
+    xuc_high_speed_latest_frame_enabled=mode!=4;
+    for(int i=0;i<3;++i) {
+      const int seq=mode*3+i+1;
+      cv::Mat image(1,1,CV_32SC1); image.at<int>(0,0)=seq;
+      camera.queue_.push({image,steady_clock::time_point(milliseconds(seq)),
+        uint64_t(seq),uint64_t(100+seq)});
+    }
+SELECTION
+    const int expected=mode*3+(mode==1 || mode==3 ? 3 : 1);
+    assert(img.at<int>(0,0)==expected && t==steady_clock::time_point(milliseconds(expected)));
+    const auto info=camera.frame_info();
+    assert(info.capture_sequence==uint64_t(expected) && info.sdk_frame_id==uint64_t(100+expected));
+    assert(info.latest_supported && info.latest_selected==camera_latest_requested);
+  }
+  io::Fallback fallback; io::CameraBase & base=fallback;
+  base.read_latest(img,t); assert(fallback.reads==1 && t==steady_clock::time_point(99ms));
+  assert(!base.frame_info().latest_supported); // Other cameras retain their original read.
+  std::cout << "PASS camera: legacy equality, low/high/low/re-entry/off, bounded retention, "
+    "stall/wake, concurrent producer, image/time/SDK-ID pairing; synthetic mean age "
+    << first_age/samples << " -> " << latest_age/samples << " ms (not field data)\n";
+}
+'''.replace("READS", reads).replace("SELECTION", selection),
+            "camera_frame_policy_test", libraries=("opencv_core",))
+
+    def test_latest_frame_imu_tail_limits(self):
+        source = (ROOT / "io/xuc.cpp").read_text(encoding="utf-8")
+        begin = source.index("bool XucSender::imu_at(")
+        method = source[begin:source.index("bool XucSender::shoot_request_ready_at", begin)]
+        standard = (ROOT / "src/standard.cpp").read_text(encoding="utf-8")
+        self.assertLess(standard.index("detector.detect(img"), standard.index("xuc.imu_at(frame_imu_requested_time"))
+        self.assertIn("frame_imu_requested_time = t + xuc_imu_alignment;", standard)
+        self.assertIn("? static_cast<io::Mode>(xuc.mode()) : io::Mode::idle", standard)
+        compile_run(r'''
+#include <algorithm>
+#include <cassert>
+#include <chrono>
+#include <cmath>
+#include <deque>
+#include <iostream>
+#include <mutex>
+#include "io/xuc.hpp"
+// Compile the real imu_at body with an in-memory history; no serial sender.
+using namespace std::chrono;
+using namespace std::chrono_literals;
+namespace offline {
+using io::XucTimedImu;
+class XucSender {
+public:
+  bool valid=true;
+  mutable std::mutex imu_history_mutex_;
+  std::deque<XucTimedImu> imu_history_;
+  bool rx_valid() const { return valid; }
+  bool imu_at(steady_clock::time_point,XucTimedImu &) const;
+};
+METHOD
+}
+int main() {
+  offline::XucSender x;
+  const auto t=steady_clock::time_point(10s);
+  for(int i=0;i<=2;++i) {
+    io::XucTimedImu sample; sample.timestamp=t+milliseconds(10*i);
+    sample.yaw=.01*i; sample.pitch=.005*i; x.imu_history_.push_back(sample);
+  }
+  io::XucTimedImu pose;
+  assert(x.imu_at(t+15ms,pose) && pose.interpolated && !pose.extrapolated);
+  assert(std::abs(pose.yaw-.015)<1e-12 && pose.timestamp==t+15ms);
+  // Latest frame t+20ms asks for t+35ms, nearer the history tail.
+  assert(x.imu_at(t+35ms,pose) && pose.extrapolated && !pose.interpolated);
+  assert(std::abs(pose.yaw-.035)<1e-12 && pose.timestamp==t+35ms);
+  assert(x.imu_at(t+45ms,pose) && pose.extrapolated); // Existing 25ms maximum.
+  assert(!x.imu_at(t+46ms,pose)); // No relaxed bound to accommodate fresh frames.
+  assert(!x.imu_at(t-21ms,pose));
+  for(int i=3;i<=4;++i) {
+    io::XucTimedImu sample; sample.timestamp=t+milliseconds(10*i);
+    sample.yaw=.01*i; sample.pitch=.005*i; x.imu_history_.push_back(sample);
+  }
+  assert(x.imu_at(t+35ms,pose) && pose.interpolated && !pose.extrapolated);
+  assert(std::abs(pose.yaw-.035)<1e-12); // Same requested image pose after inference.
+  x.imu_history_[3].yaw=3.; x.imu_history_[4].yaw=-3.;
+  assert(!x.imu_at(t+65ms,pose)); // Rate too high; nearest also beyond 20ms.
+  assert(x.imu_at(t+60ms,pose) && !pose.extrapolated && pose.nearest_offset_ms==-20.);
+  x.valid=false; assert(!x.imu_at(t+35ms,pose)); // Stale feedback still blocks sync.
+  std::cout << "PASS actual IMU: t+15ms, interpolation/extrapolation/nearest, "
+    "25ms/20ms bounds, rate limit, invalid feedback; no waiting or hardware\n";
+}
+'''.replace("METHOD", method), "camera_imu_tail_test")
+
+    def test_yaw_zero_shadow_is_read_only_and_uses_same_point(self):
+        source = (ROOT / "src/standard.cpp").read_text(encoding="utf-8")
+        begin = source.index("struct YawZeroReferenceShadow")
+        shadow = source[begin:source.index("\n};", begin) + 3]
+        call = source.index("const auto shadow = YawZeroReferenceShadow::compare(")
+        self.assertGreater(call, source.index("// Continuous debug evidence"))
+        self.assertGreater(call, source.index("xuc.send(command"))
+        self.assertIn("if (high_speed_mode && !gyro_model_fresh && native_prediction_valid", source[:call])
+        begin = source.index("gyro_predicted_impact_yaw_error_rad = std::remainder(")
+        legacy = source[begin:source.index(";", begin)+1]
+        compile_run(r'''
+#include <array>
+#include <cassert>
+#include <cmath>
+#include <iostream>
+SHADOW
+double actual(double qualified_predicted_yaw,double reference,double xuc_gyro_predicted_yaw_trim_rad) {
+  const std::array<double,3> ypr{reference,0.,0.};
+  double gyro_predicted_impact_yaw_error_rad=NAN;
+LEGACY
+  return gyro_predicted_impact_yaw_error_rad;
+}
+int main() {
+  const double r=M_PI/180.; int cases=0;
+  for(double reference : {-179.9*r,0.,179.9*r})
+  for(double error : {-.20001*r,-.2*r,0.,.2*r,.20001*r,1.3*r})
+  for(double trim : {0.,.1*r})
+  for(double correction : {0.,-1.3*r,1.3*r}) {
+    const double predicted=reference+trim+error;
+    auto s=YawZeroReferenceShadow::compare(predicted,reference,trim,correction,.2*r);
+    assert(s.valid && s.legacy_error_rad==actual(predicted,reference,trim));
+    const double expected=std::remainder(error+correction,2*M_PI);
+    assert(std::abs(std::remainder(s.command_frame_error_rad-expected,2*M_PI))<1e-14);
+    if(correction==0.) assert(s.legacy_pass==s.command_frame_pass);
+    ++cases;
+  }
+  auto a=YawZeroReferenceShadow::compare(0.,0.,0.,-1.3*r,.2*r);
+  assert(a.legacy_pass && !a.command_frame_pass);
+  auto b=YawZeroReferenceShadow::compare(1.3*r,0.,0.,-1.3*r,.2*r);
+  assert(!b.legacy_pass && b.command_frame_pass);
+  assert(!YawZeroReferenceShadow::compare(NAN,0.,0.,0.,.2*r).valid);
+  assert(!YawZeroReferenceShadow::compare(0.,0.,0.,0.,-.1).valid);
+  std::cout << "PASS " << cases << " same-point zero shadow cases: current gate equality, "
+    "wrap, trim, offset hypotheses, invalid input; diagnostic runs after send\n";
+}
+'''.replace("SHADOW", shadow).replace("LEGACY", legacy), "yaw_zero_shadow_test")
+
+    def test_calibrated_solver_and_wire_yaw_chain(self):
+        source = (ROOT / "tasks/auto_aim/solver.cpp").read_text(encoding="utf-8")
+        begin = source.index("void Solver::set_R_gimbal2world(")
+        rotation = source[begin:source.index("//solvePnP", begin)]
+        compile_run(r'''
+#include <cassert>
+#include <cmath>
+#include <iostream>
+#include <Eigen/Geometry>
+#include <yaml-cpp/yaml.h>
+#include "tools/math_tools.hpp"
+namespace auto_aim {
+class Solver {
+public:
+  Eigen::Matrix3d R_gimbal2imubody_, R_gimbal2world_;
+  void set_R_gimbal2world(const Eigen::Quaterniond &);
+};
+ROTATION
+}
+int main(int argc,char ** argv) {
+  assert(argc==2);
+  const auto yaml=YAML::LoadFile(argv[1]);
+  const auto d=yaml["R_gimbal2imubody"].as<std::vector<double>>();
+  const double tx=yaml["xuc_yaw_sign"].as<double>();
+  const double rx=yaml["xuc_imu_yaw_sign"].as<double>();
+  const double offset=yaml["xuc_imu_yaw_offset_rad"].as<double>();
+  auto_aim::Solver solver;
+  solver.R_gimbal2imubody_=Eigen::Matrix<double,3,3,Eigen::RowMajor>(d.data());
+  for(double raw : {-.5,-.2,0.,.2,.5}) for(double pitch : {-.15,0.,.15}) {
+    Eigen::Quaterniond q=Eigen::AngleAxisd(rx*raw+offset,Eigen::Vector3d::UnitZ()) *
+      Eigen::AngleAxisd(pitch,Eigen::Vector3d::UnitY());
+    solver.set_R_gimbal2world(q);
+    const double world_yaw=tools::eulers(solver.R_gimbal2world_,2,1,0)[0];
+    assert(std::abs(world_yaw+rx*raw+offset)<1e-12);
+    assert(std::abs(tx*world_yaw-raw)<1e-8);
+  }
+  std::cout << "PASS configured raw IMU -> Solver conjugation -> command wire yaw: "
+    "compatible sign/scale in both directions; physical bore zero remains unverified\n";
+}
+'''.replace("ROTATION", rotation), "yaw_frame_chain_test",
+            sources=("tools/math_tools.cpp",), libraries=("opencv_core", "yaml-cpp"),
+            arguments=(str(ROOT / "configs/standard.yaml"),))
+
     def test_actual_rgb_gate_and_yolo_acceptance(self):
         source = (ROOT / "tasks/auto_aim/yolos/yolo26.cpp").read_text(encoding="utf-8")
         check = source[source.index("bool YOLO26::check_name("):
@@ -258,6 +527,7 @@ int main() {
   uint64_t work_zone_track_epoch=1;
   bool xuc_imu_sync_valid=true,direct_measurement_from_tracker=true;
   bool direct_yaw_measurement_fresh=true,direct_pitch_measurement_fresh=true;
+  bool tracker_profile_changed=false;
   std::vector<Target> targets(1);
   io::Command command{true,true,.3,.12};
   double yaw_tracking_integral_raw_rad=1;
@@ -285,6 +555,17 @@ BLOCK
     command={true,true,.3,.12};std::this_thread::sleep_for(std::chrono::milliseconds(1));update();
     assert(command.control==(i==1));
   }
+  for(int transition=0;transition<2;++transition) { // Legacy -> high -> legacy.
+    const auto previous_epoch=work_zone_track_epoch;
+    tracker_profile_changed=true;command={true,true,.3,.12};
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));update();
+    assert(work_zone_track_epoch==previous_epoch+1 && !command.control && !command.shoot);
+    tracker_profile_changed=false;
+    for(int i=0;i<2;++i) {
+      command={true,true,.3,.12};std::this_thread::sleep_for(std::chrono::milliseconds(1));update();
+      assert(command.control==(i==1));
+    }
+  }
   command={true,true,9,9};direct_measurement_from_tracker=false;
   std::this_thread::sleep_for(std::chrono::milliseconds(1));update();
   assert(command.control && !command.shoot && command.inhibit_shoot);
@@ -297,7 +578,7 @@ FULL_FRAME
   std::this_thread::sleep_for(std::chrono::milliseconds(160));update();
   assert(!command.control && !command.shoot);
   xuc.phase=false;update();assert(!command.control);
-  std::cout << "PASS production integration: mode_TJ=1 phase, current associated observation, 3-frame confirmation, 150ms loss, no stale angles/fire, full-frame search\n";
+  std::cout << "PASS production integration: mode_TJ=1 phase, current associated observation, 3-frame confirmation, tracker-profile requalification, 150ms loss, no stale angles/fire, full-frame search\n";
 }
 '''.replace("BLOCK", block).replace("FULL_FRAME", full_frame), "work_zone_integration_test")
 

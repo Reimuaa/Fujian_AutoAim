@@ -70,7 +70,7 @@ yolo26_color_hold_frames: 20
 detector_debug: false
 # 排查时改为 true：记录帧/IMU、检测、跟踪、双轴指令及反馈，最多 3000 条摘要和 20 张丢失画面。
 # 正式运行保持 false，避免同步刷盘和图片编码影响下一帧。
-infantry_diagnostics_enabled: false
+infantry_diagnostics_enabled: true
 
 use_traditional: true
 # YOLO26 previously ignored use_traditional.  The adaptive two-light-bar
@@ -135,6 +135,9 @@ whole_state_iekf_huber_threshold: 2.5
 # Temporary whole-EKF trial: disable ESKF updates, phase/rate substitution and CV geometry.
 # true restores the previous ESKF path; restart the field program after changing it.
 yaw_eskf_enabled: false
+# Restore the 26.10.19 stationary/low-speed ESKF + plate-motion path in an
+# independent tracker. The configured high-speed tracker stays EKF-only.
+xuc_restore_legacy_stationary_low_speed: true
 # When disabled, min updates, rate std and max abs rate below gate whole-EKF trust.
 yaw_eskf_angular_jerk_variance: 20.0
 yaw_eskf_measurement_floor_deg: 1.0
@@ -155,9 +158,10 @@ leaving_angle: 20
 
 decision_speed: 0.8
 # Explicit motion-mode delays; changing high speed must not alter low speed.
-# All three retain the current 330ms base; event timing remains separate.
+# High speed is now 370 ms with the 0.2 deg gate: 30 ms more lead than the
+# original 340, i.e. ~7.8 deg earlier at 4.6 rad/s. Low/stationary stay 330 ms.
 stationary_delay_time: 0.330
-high_speed_delay_time: 0.338
+high_speed_delay_time: 0.370
 low_speed_delay_time: 0.330
 
 actuation_delay_ms: 0
@@ -254,11 +258,25 @@ xuc_fire_guard_enabled: true       # require fresh measured armor in both axes
 xuc_fire_stable_ms: 120.0          # short debounce; single-shot command cycle handles repetition
 xuc_fire_yaw_tolerance_deg: 3.0    # 0.91m约±4.8cm，仍在小装甲板水平范围内
 xuc_fire_pitch_tolerance_deg: 1.1  # 介于无射击的0.8°与明显低弹的2.0°之间；配合更强Pitch闭环
+# Additional qualification applies only to classified high speed.
+xuc_high_speed_pitch_gate_enabled: true
+xuc_high_speed_pitch_tolerance_deg: 0.45
+xuc_high_speed_pitch_tracking_tolerance_deg: 0.8
+xuc_high_speed_pitch_variation_deg: 0.15
+xuc_high_speed_pitch_stable_ms: 30.0
+# Empirical same-face/nearby-phase error of forecasts as actually issued.
+xuc_high_speed_prediction_quality_enabled: true
+xuc_high_speed_prediction_quality_max_error_deg: 0.45
+# Joint fixed-centre model runs independently; shadow output never controls/fire.
+xuc_high_speed_fixed_center_shadow_enabled: true
+# 仅高速：联合固定中心模型持续就绪后接管预测及中心跟随；失效时回退并重置资格
+xuc_high_speed_fixed_center_prediction_enabled: true
 xuc_gyro_center_follow_enabled: true
 xuc_gyro_omega_threshold_rad_s: 0.8
 # Independent stationary / low_speed / high_speed classification.
 # Enable the optional PLL predictor only for the high_speed field trial.
 xuc_high_speed_phase_enabled: false
+xuc_high_speed_latest_frame_enabled: true # 仅已分类高速的下一次取图选最新帧；低速/静止仍保留最早待处理帧
 xuc_vehicle_model_enter_rad_s: 0.8
 xuc_vehicle_model_exit_rad_s: 0.45
 xuc_high_speed_enter_rad_s: 3.2
@@ -288,7 +306,9 @@ xuc_gyro_predicted_fire_enabled: true
 # while the physical phase event clock is unlocked.  This prevents event=0,
 # cycle=-1 rounds such as shots 1-20 in the 2026-09-11 23:34 field log.
 xuc_gyro_require_event_lock_for_fire: true
-xuc_gyro_predicted_yaw_tolerance_deg: 0.3
+# Low-speed vehicle prediction: tightened to 0.4 degrees by field request.
+# Stationary pixel gates and the independent high-speed gate below are unchanged.
+xuc_gyro_predicted_yaw_tolerance_deg: 0.4
 # High-speed-only gate; the previous key remains the accepted low-speed gate.
 xuc_high_speed_predicted_yaw_tolerance_deg: 0.2
 xuc_gyro_predicted_yaw_trim_deg: 0.0
@@ -332,7 +352,7 @@ xuc_camera_above_muzzle_m: 0.04          # 实测：相机中心在炮口上方 
 xuc_ballistic_reference_camera_range_m: 0.91
 xuc_ballistic_reference_total_drop_m: 0.08639  # physical 10m/s reference; zero fixed boresight bias
 xuc_ballistic_max_compensation_deg: 20.0    # 低弹速远距离补偿上限；下位机另保留25°/28°双层保护
-xuc_ballistic_pitch_trim_deg: 0.0      # 取消固定俯仰微调，仅保留原有弹道补偿
+xuc_ballistic_pitch_trim_deg: 0.0       # 取消固定俯仰微调，仅保留原有弹道补偿
 # Robust shared range for ballistic elevation and gyro time-of-flight.  The
 # rigid-body near-face range is authoritative; raw PnP depth contributes only a
 # bounded 5% correction so oblique plates cannot move the aim by metres.
@@ -406,4 +426,4 @@ xuc_event_require_face_consistency: false
 xuc_event_face_max_alignment_deg: 15.0
 xuc_event_gimbal_tracking_tolerance_deg: 4.0
 xuc_shot_rearm_ms: 0                # 静止/低速保持原节奏，无额外最小请求间隔
-xuc_high_speed_shot_rearm_ms: 1000  # 仅高速：距最近shoot=1成功发送完成至少1000ms；到期重判，不补发旧请求
+xuc_high_speed_shot_rearm_ms: 0  # High-speed extra minimum request interval disabled; wire release still applies.

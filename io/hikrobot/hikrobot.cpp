@@ -29,7 +29,6 @@ HikRobot::HikRobot(const std::string & config_path)
   grabbing_(false),
   capturing_(false),
   capture_quit_(false),
-  queue_(1),
   vid_(-1),
   pid_(-1)
 {
@@ -105,11 +104,22 @@ HikRobot::~HikRobot()
 
 void HikRobot::read(cv::Mat & img, std::chrono::steady_clock::time_point & timestamp)
 {
-  CameraData data;
-  queue_.pop(data);
+  read_frame(img, timestamp, false);
+}
+
+void HikRobot::read_latest(cv::Mat & img, std::chrono::steady_clock::time_point & timestamp)
+{
+  read_frame(img, timestamp, true);
+}
+
+void HikRobot::read_frame(
+  cv::Mat & img, std::chrono::steady_clock::time_point & timestamp, bool prefer_latest)
+{
+  const auto data = queue_.pop(prefer_latest);
 
   img = data.img;
   timestamp = data.timestamp;
+  last_frame_info_ = {true, prefer_latest, data.capture_sequence, data.sdk_frame_id};
 }
 
 void HikRobot::capture_start()
@@ -253,7 +263,7 @@ void HikRobot::capture_start()
         continue;
       }
 
-      queue_.push({rgb_img, timestamp});
+      queue_.push({rgb_img, timestamp, ++capture_sequence_, raw.stFrameInfo.nFrameNum});
 
       ret = MV_CC_FreeImageBuffer(handle_, &raw);
       if (ret != MV_OK) {

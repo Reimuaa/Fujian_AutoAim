@@ -5,10 +5,45 @@
 #include <functional>
 #include <iostream>
 #include <mutex>
+#include <optional>
 #include <queue>
+#include <utility>
 
 namespace tools
 {
+// A single consumer may choose the first pending frame (legacy single-slot
+// behaviour) or the latest completed frame. Keep both at the producer: a
+// consumer cannot recover new frames already discarded by a full FIFO.
+// Consuming either clears both slots, so a mode switch cannot replay a frame.
+// T should share its image storage; at most two different frames are retained.
+template <typename T>
+class CameraFrameQueue
+{
+public:
+  void push(const T & value)
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!first_) first_ = value;
+    latest_ = value;
+    not_empty_.notify_one();
+  }
+
+  T pop(bool prefer_latest = false)
+  {
+    std::unique_lock<std::mutex> lock(mutex_);
+    not_empty_.wait(lock, [this] { return first_.has_value(); });
+    T value = std::move(prefer_latest ? *latest_ : *first_);
+    first_.reset();
+    latest_.reset();
+    return value;
+  }
+
+private:
+  std::optional<T> first_, latest_;
+  std::mutex mutex_;
+  std::condition_variable not_empty_;
+};
+
 template <typename T, bool PopWhenFull = false>
 class ThreadSafeQueue
 {

@@ -32,6 +32,90 @@ def stats(values):
             "abs_p95": absolute[round((len(values) - 1) * .95)]}
 
 
+def compare_yaw_zero_references(error_rad, correction_rad, tolerance_rad):
+    """Same point/reference/trim, with the command-frame offset as a hypothesis."""
+    if not all(finite(x) for x in (error_rad, correction_rad, tolerance_rad)) or tolerance_rad < 0:
+        return None
+    legacy = math.remainder(error_rad, math.tau)
+    command = math.remainder(legacy + correction_rad, math.tau)
+    return {"legacy_error_rad": legacy, "command_frame_error_rad": command,
+            "legacy_pass": abs(legacy) <= tolerance_rad,
+            "command_frame_pass": abs(command) <= tolerance_rad}
+
+
+def analyze_yaw_zero_shadow(frames):
+    """Read recorded continuous high-speed gates; no future labels or new requests."""
+    rows, excluded = [], Counter()
+    for f in frames:
+        if f.get("rotation_mode") != "high_speed":
+            continue
+        if (f.get("gate_prediction_source") not in ("native_prediction", "fixed_center_prediction") or
+                f.get("fire_branch") not in ("vehicle_prediction", "high_speed_prediction") or
+                not f.get("native_prediction_valid")):
+            excluded["not_native_predictive_gate"] += 1
+            continue
+        shadow = f.get("yaw_zero_shadow") or {}
+        correction = shadow.get("command_correction_rad")
+        if not finite(correction):
+            boresight, impact = f.get("yaw_boresight_correction_rad"), f.get("yaw_impact_correction_rad")
+            if finite(boresight) and finite(impact):
+                correction = max(-math.radians(10), min(math.radians(10), boresight + impact))
+        result = compare_yaw_zero_references(
+            f.get("gate_error_rad"), correction, f.get("gate_tolerance_rad"))
+        if result is None:
+            excluded["missing_recorded_error_correction_or_tolerance"] += 1
+            continue
+        # A future schema or a stale shadow must not silently validate itself.
+        if shadow and (not shadow.get("valid") or any(
+                not finite(shadow.get(k)) or
+                abs(math.remainder(shadow[k] - result[k], math.tau)) > 1e-9
+                for k in ("legacy_error_rad", "command_frame_error_rad")) or any(
+                    shadow.get(k) != result[k] for k in ("legacy_pass", "command_frame_pass"))):
+            excluded["runtime_shadow_mismatch"] += 1
+            continue
+        rows.append({"run": f["run"], "frame_seq": f["frame_seq"],
+                     "prediction_source": f.get("gate_prediction_source"),
+                     "prediction_ns": f.get("gate_prediction_ns"), "face_id": f.get("gate_face_id"),
+                     "log_time": f.get("log_time"), "request_shoot": bool(f.get("request_shoot")),
+                     "omega_sign": "positive" if (f.get("omega_rad_s") or 0) > 0 else "negative",
+                     "source": "runtime_shadow" if shadow else "recorded_gate_and_corrections",
+                     "command_correction_deg": math.degrees(correction), **result})
+
+    def summarize(selected):
+        counts = Counter((r["legacy_pass"], r["command_frame_pass"]) for r in selected)
+        return {"frames": len(selected), "both_pass": counts[True, True],
+                "legacy_only_pass": counts[True, False],
+                "command_frame_only_pass": counts[False, True], "neither_pass": counts[False, False],
+                "legacy_error_deg": stats([math.degrees(r["legacy_error_rad"]) for r in selected]),
+                "command_frame_error_deg": stats([math.degrees(r["command_frame_error_rad"]) for r in selected])}
+
+    return {"basis": "same_recorded_native_point_and_reference_command_frame_hypothesis",
+            "physical_bore_zero_verified": False, "new_requests_simulated": False,
+            "all_compared": summarize(rows),
+            "same_original_requests": summarize([r for r in rows if r["request_shoot"]]),
+            "by_rotation_sign": {s: summarize([r for r in rows if r["omega_sign"] == s])
+                                 for s in ("negative", "positive")},
+            "exclusions": dict(excluded), "samples": rows,
+            "limitation": "Yaw gate only; disagreement does not identify the physical zero or justify applying an offset. Other gates and timing are not replayed."}
+
+
+def analyze_camera_policy(frames):
+    """Application capture sequence is not an SDK loss counter or exposure clock."""
+    rows = [f for f in frames if (f.get("camera_capture_sequence") or 0) > 0]
+    groups = {}
+    for policy in (False, True):
+        selected = [f for f in rows if bool(f.get("camera_latest_selected")) == policy]
+        groups["latest" if policy else "first_pending"] = {
+            "frames": len(selected),
+            "age_at_read_ms": stats([f.get("camera_age_at_read_ms") for f in selected]),
+            "skipped_converted_frames": sum(f.get("camera_skipped_frames", 0) for f in selected),
+            "imu_invalid": sum(not f.get("frame_imu_valid") for f in selected),
+            "imu_extrapolated": sum(bool(f.get("frame_imu_extrapolated")) for f in selected),
+            "imu_nearest_offset_ms": stats([f.get("frame_imu_nearest_offset_ms") for f in selected])}
+    return {"status": "recorded" if rows else "no_capture_metadata", "groups": groups,
+            "limitation": "Policy uses the preceding frame's motion classification. Host receipt age includes the configured offset; physical exposure time and SDK buffering remain unverified."}
+
+
 def read_frames(paths):
     frames, seen, parse_errors = [], set(), 0
     legacy_priors, legacy_conflicts = {}, set()
@@ -712,6 +796,8 @@ def analyze(frames, max_offset_ms=25.0):
         "tracking_exclusions": dict(tracking_excluded),
         "attribution": analyze_attribution(frames, residuals),
         "dual_geometry": analyze_dual_geometry(frames),
+        "yaw_zero_shadow": analyze_yaw_zero_shadow(frames),
+        "camera_policy": analyze_camera_policy(frames),
         "center_speed_mps": stats([math.hypot(s[1], s[3]) for s in states]),
         "debug_capture_us": stats([f.get("capture_us") for f in frames]),
         "frame_to_write_ms": stats([(f["tx_write_complete_ns"] - f["frame_ns"]) / 1e6
@@ -776,6 +862,7 @@ def main():
     compact["dual_geometry"] = {k: v for k, v in report["dual_geometry"].items()
                                if k not in ["groups", "view_angle_updates", "pair_samples"]}
     compact["attribution"] = {k: v for k, v in report["attribution"].items() if k not in ["current_groups", "future_groups"]}
+    compact["yaw_zero_shadow"] = {k: v for k, v in report["yaw_zero_shadow"].items() if k != "samples"}
     if "pnp_replay" in report:
         compact["pnp_replay"] = {k: v for k, v in report["pnp_replay"].items() if k != "groups"}
     print(json.dumps(compact,

@@ -10,14 +10,22 @@ if [[ ! -f "${config_path}" ]]; then
   exit 1
 fi
 
-matching_lines=$(grep -Ec "^${config_key}: (true|false)$" "${config_path}" || true)
+# Count the key independently of its value so malformed duplicate keys cannot
+# be hidden by the value matcher. Configs edited on Windows may use CRLF.
+matching_lines=$(grep -Ec "^${config_key}[[:blank:]]*:" "${config_path}" || true)
 if [[ "${matching_lines}" -ne 1 ]]; then
   notify-send --urgency=critical "日志模式切换失败" \
     "${config_key} 必须在正式配置中且只能出现一次" || true
   exit 1
 fi
 
-current_value=$(awk -v key="${config_key}" '$1 == key ":" {print $2}' "${config_path}")
+value_pattern="^(${config_key}[[:blank:]]*:[[:blank:]]*)(true|false)([[:blank:]]*(#.*)?\r?)$"
+current_value=$(sed -nE "s/${value_pattern}/\2/p" "${config_path}")
+if [[ "${current_value}" != "true" && "${current_value}" != "false" ]]; then
+  notify-send --urgency=critical "日志模式切换失败" \
+    "${config_key} 必须为 true 或 false" || true
+  exit 1
+fi
 if [[ "${current_value}" == "true" ]]; then
   next_value="false"
   mode_name="简洁模式"
@@ -28,7 +36,8 @@ else
   mode_detail="记录完整诊断；重启自瞄程序后生效"
 fi
 
-sed -i "s/^${config_key}: ${current_value}$/${config_key}: ${next_value}/" "${config_path}"
+# Preserve indentation, inline comments and the original LF/CRLF line ending.
+sed -i -E "s/${value_pattern}/\1${next_value}\3/" "${config_path}"
 
 echo "日志模式已切换为：${mode_name}"
 echo "${mode_detail}"

@@ -94,7 +94,9 @@ public:
     double center_acceleration_variance = std::numeric_limits<double>::quiet_NaN();
   };
 
-  Tracker(const std::string & config_path, Solver & solver);
+  Tracker(
+    const std::string & config_path, Solver & solver,
+    std::optional<bool> yaw_eskf_override = std::nullopt);
 
   std::string state() const;
   int temp_lost_count() const { return temp_lost_count_; }

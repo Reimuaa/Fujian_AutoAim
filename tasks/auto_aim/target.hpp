@@ -81,6 +81,9 @@ public:
   // Coherent rigid-body geometry from the whole-vehicle EKF only. Association
   // and existing motion consumers continue to use armor_xyza_list()/ekf_x().
   std::vector<Eigen::Vector4d> whole_ekf_armor_xyza_list() const;
+  // A prediction-only value object for an independent fixed-centre shadow.
+  // The live tracker and all non-high-speed consumers remain untouched.
+  std::optional<Target> with_fixed_center_prediction(const Eigen::VectorXd & state) const;
   int armor_num() const;
 
   bool diverged() const;
@@ -106,6 +109,7 @@ private:
   IteratedUpdateConfig iterated_update_config_;
   CenterProcessConfig center_process_config_;
   double center_acceleration_variance_ = 100.0;
+  bool fixed_center_prediction_ = false;
   std::chrono::steady_clock::time_point t_;
 
   void update_ypda(const Armor & armor, int id);  // yaw pitch distance angle

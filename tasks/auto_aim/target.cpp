@@ -132,6 +132,7 @@ void Target::predict(double dt)
       : center_process_config_.acceleration_variance;
     v2 = 64;  // 角加速度方差
   }
+  if (fixed_center_prediction_) v1 = 0.0;
   center_acceleration_variance_ = v1;
   auto a = dt * dt * dt * dt / 4;
   auto b = dt * dt * dt / 2;
@@ -427,6 +428,23 @@ Eigen::VectorXd Target::ekf_x() const
 }
 
 const tools::ExtendedKalmanFilter & Target::ekf() const { return ekf_; }
+
+std::optional<Target> Target::with_fixed_center_prediction(const Eigen::VectorXd & state) const
+{
+  if (yaw_eskf_enabled() || armor_num_ != 4 || state.size() != 11 || !state.allFinite() ||
+      state[8] <= 0.05 || state[8] >= 0.5 || state[8] + state[9] <= 0.05 ||
+      state[8] + state[9] >= 0.5) return {};
+  Target out = *this;
+  out.ekf_.x = state;
+  for (int index : {1, 3, 5}) {
+    out.ekf_.x[index] = 0.0;
+    out.ekf_.P.row(index).setZero();
+    out.ekf_.P.col(index).setZero();
+  }
+  out.fixed_center_prediction_ = true;
+  out.jumped = true;
+  return out;
+}
 
 bool Target::yaw_eskf_enabled() const { return yaw_eskf_.enabled(); }
 

@@ -32,6 +32,7 @@ struct AimPredictionTrace
 {
   bool valid = false, converged = false;
   bool whole_ekf_geometry = false;
+  bool final_point_selection = false;
   int face_id = -1, iterations = 0;
   int64_t base_prediction_ns = 0, prediction_ns = 0;
   double delay_s = std::numeric_limits<double>::quiet_NaN();

@@ -1,5 +1,7 @@
 # 工程架构与开发调试指南
 
+当前高速资格/固定中心对照的本机入口为`tests/test_high_speed_fire_quality.py`和`tests/replay_high_speed_qualification.py`，均不访问硬件。资格组件在非高速模式直接放行并清除自身历史；固定中心使用独立模型和预测对象，不修改用于分类或恢复非高速路径的Tracker。用户负责开火后延迟与弹速调试，代码改进范围到资格和请求发送。当前参数与发布状态优先查看`docs/configuration.md`和`docs/status.md`最新条目。
+
 
 2026-10-18核对小电脑当前参数：Aimer延迟330ms、旋转门限0.6°、20m/s、P轴固定微调0°、高/低电平保持100/50ms、ROI开启、YOLO26角点细化关闭；高速相位分支关闭。选面退出边界的一步判定已接入正式代码，当前合格帧仍须通过全部原有门限。
 现场证据和后续方案见[工作日志](../步兵自瞄工作日志.md)，主控操作见[步兵构建、烧录与调试](../firmware/infantry/README.md)。后文历史试验数值只代表对应时段。
@@ -36,13 +38,13 @@ flowchart TD
   MODE --> STD[standard整合<br/>中心跟随、直接测量、限速、开火条件]
   AIM --> STD
   PHASE[高速相位事件调度] --> STD
-  STD --> SEND[XucSender<br/>高低电平周期、角度保持]
+  STD --> SEND[XucSender<br/>低电平释放、请求间隔]
   SEND --> MCU[STM32<br/>运动和供弹状态机]
   MCU --> RX
   STD -. Debug快照 .-> LOG[有界异步日志]
 ~~~
 
-`src/standard.cpp`是实际整合入口。Aimer返回的yaw/pitch随后还会经过中心跟随/直接测量、修正、限速和门控；XucSender在高电平期间会保持接受请求时的角度。因此不能只读Aimer就判断真实云台命令。
+`src/standard.cpp`是实际整合入口。Aimer返回的yaw/pitch随后还会经过中心跟随/直接测量、修正、限速和门控。XucSender只发送一包shoot=1，后续shoot=0使用最新命令角度；当前没有开火后固定锁角。判断真实云台命令需核对发送器最终包，不能只读Aimer。
 
 `control`是控制许可，`shoot`是软件请求。软件请求、串口写成功、拨弹动作、真实出弹、实际命中必须分别记录。
 
@@ -124,6 +126,8 @@ t_impact = t_base + 迭代飞行时间
 
 Aimer按值接收Target、用副本迭代，未来预测不会写回Tracker当前状态。主滤波仍可能存在偏差，但没有“从第三发开始把未来预测逐发累计回去”的机制。
 
+显式高速whole-EKF预测现按四个物理板面分别求解，同一次迭代不切换板面，只对最终预测点检查原可射角，且要求收敛。静止/低速及automatic调用保留原逻辑。固定中心接管使用独立联合模型和Target副本，原Tracker状态与三态分类不改；模型持续就绪200ms后接管，连续150ms失效后回退，短缺口只保留源归属。切换清空候选资格并重新确认目标，不保留待发请求，各源使用各自的分面修正和质量历史。当前用于中心固定的自转靶，移动靶可在正式配置关闭固定中心接管。
+
 `frame_ns`、IMU及发送时间使用主机steady-clock纳秒；日志墙钟用于人工对齐，不跨进程混减不同时间基准。图像时间戳是主机接收时刻加配置偏移，并非已测得曝光中心；IMU对齐15ms也不是完整物理同步证明。
 
 ## 5. 开火链和协议
@@ -154,7 +158,7 @@ USART6、460800、SP包头、CRC16，角度rad：
 
 `infantry_diagnostics_enabled`控制新增诊断。简洁模式须在最外层关闭采集、构造、分配、格式化、异步写入及影子预测；仅调低日志级别仍可能执行参数求值。正常算法所需计算继续执行。
 
-`tools/toggle_infantry_diagnostics.sh`修改正式配置，用户重启生效。本轮未执行。运行Debug开关与编译Debug不同，Release程序也能记录诊断。
+`tools/toggle_infantry_diagnostics.sh`修改正式配置，用户重启生效。切换兼容LF/CRLF换行、水平空格及行尾注释，只替换布尔值，保留原格式；配置键缺失、重复或值非法时拒绝修改。2026-10-22已修复Windows换行被旧精确匹配误报为缺失的问题并同步小电脑。离线回归为`python3 -m unittest discover -s tests -p test_toggle_infantry_diagnostics.py -v`，只使用系统临时目录配置和通知替身，不启动自瞄。运行Debug开关与编译Debug不同，Release程序也能记录诊断。
 
 程序日志`logs/YYYY-MM-DD_HH-MM-SS.log`；启动器记录`logs/xuc-bringup/日期/`；原始图像等在`data/`。启动器只保留最近20份一键日志，不要误认所有证据永远保留。
 

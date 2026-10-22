@@ -134,6 +134,55 @@ io::Command Aimer::aim(
 
   if (trace) trace->base_prediction_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
     future.time_since_epoch()).count();
+  if (timing == AimTiming::high_speed && whole_ekf_geometry && target.jumped) {
+    // A face need not be selectable at the intermediate base time. Solve each
+    // physical face consistently, then apply the existing window at its final
+    // point. Explicit high-speed timing keeps the legacy paths unchanged.
+    debug_aim_point = {false, Eigen::Vector4d::Zero()};
+    if (trace) trace->final_point_selection = true;
+    const auto base_faces = target.whole_ekf_armor_xyza_list();
+    for (std::size_t face = 0; face < base_faces.size(); ++face) {
+      const auto & initial = base_faces[face];
+      tools::Trajectory initial_traj(bullet_speed, initial.head<2>().norm(), initial[2]);
+      if (!initial.allFinite() || initial_traj.unsolvable ||
+          !std::isfinite(initial_traj.fly_time) || initial_traj.fly_time <= 0.0) continue;
+      double previous_flight = initial_traj.fly_time;
+      for (int iteration = 0; iteration < 10; ++iteration) {
+        const auto prediction_time = future + std::chrono::microseconds(
+          static_cast<int>(previous_flight * 1e6));
+        auto candidate = target;
+        candidate.predict(prediction_time);
+        const auto faces = candidate.whole_ekf_armor_xyza_list();
+        if (face >= faces.size() || !faces[face].allFinite()) break;
+        const auto & point = faces[face];
+        tools::Trajectory trajectory(bullet_speed, point.head<2>().norm(), point[2]);
+        if (trajectory.unsolvable || !std::isfinite(trajectory.fly_time) ||
+            trajectory.fly_time <= 0.0) break;
+        if (std::abs(trajectory.fly_time - previous_flight) < 0.001) {
+          const auto & state = candidate.ekf().x;
+          const double phase = tools::limit_rad(point[3] - std::atan2(state[2], state[0]));
+          const bool selectable = std::abs(phase) <= comming_angle_ &&
+            (state[7] > 0.0 ? phase < leaving_angle_ : phase > -leaving_angle_);
+          const double yaw = std::atan2(point[1], point[0]) + yaw_offset_;
+          const double pitch = -(trajectory.pitch + pitch_offset_);
+          if (!selectable || !std::isfinite(yaw) || !std::isfinite(pitch)) break;
+          debug_aim_point = {true, point};
+          if (trace) {
+            trace->valid = trace->converged = true;
+            trace->face_id = static_cast<int>(face);
+            trace->prediction_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+              prediction_time.time_since_epoch()).count();
+            trace->flight_time_used_s = previous_flight;
+            trace->flight_time_s = trajectory.fly_time;
+            trace->iterations = iteration + 1;
+          }
+          return {true, false, yaw, pitch};
+        }
+        previous_flight = trajectory.fly_time;
+      }
+    }
+    return {false, false, 0, 0};
+  }
   auto aim_point0 = choose_aim_point(target, whole_ekf_geometry);
   debug_aim_point = aim_point0;
   if (!aim_point0.valid) {

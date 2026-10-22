@@ -52,6 +52,11 @@ public:
     int phase_cycles = 0;
     double phase_bias_rad = NAN, phase_scatter_rad = NAN;
     uint64_t model_revision = 0;
+    // Past issued (already corrected) forecasts, scored only after their full
+    // future reference bracket and an independent passage have completed.
+    bool quality_ready = false;
+    int quality_cycles = 0;
+    double past_error_bound_rad = NAN;
   };
 
   // A moving query along ONE learned curve is not a model replacement. Reset
@@ -84,7 +89,7 @@ public:
     if (!context) { clear(); last_frame_ns_ = in.frame_ns; return status(); }
     const int sign = in.omega_rad_s > 0.0 ? 1 : -1;
     if (in.rebuilt || epoch_ != in.epoch || sign_ != sign ||
-        (last_frame_ns_ && in.frame_ns - last_frame_ns_ >= loss_ns)) clear();
+        (last_frame_ns_ && in.frame_ns - last_frame_ns_ >= frame_gap_ns)) clear();
     last_frame_ns_ = in.frame_ns;
     epoch_ = in.epoch;
     sign_ = sign;
@@ -102,7 +107,7 @@ public:
          std::abs(in.delay_s - anchor_->delay) > 0.001 ||
          std::abs(in.speed_mps - anchor_->speed) > 1.0 ||
          std::abs(horizon_s - anchor_->horizon) > 0.12)) clear_history();
-    if (last_observation_ns_ && in.frame_ns - last_observation_ns_ >= loss_ns)
+    if (last_observation_ns_ && in.frame_ns - last_observation_ns_ >= observation_loss_ns)
       clear_history();
     if (forecast && !anchor_)
       anchor_ = Anchor{in.center_range_m, in.omega_rad_s, in.delay_s, in.speed_mps, horizon_s};
@@ -129,6 +134,17 @@ public:
       const auto reference = interpolate(faces_[p.face].observations, p.time);
       if (!reference) { ++unmatched_; continue; }
       const double error = std::remainder(p.yaw - *reference, 2.0 * pi);
+      auto & quality_face = faces_[p.face];
+      if (std::isfinite(error)) {
+        if (!quality_face.quality_group.empty() &&
+            p.time + bracket_ns - quality_face.quality_last > cycle_gap_ns)
+          close_quality(quality_face);
+        if (quality_face.quality_group.empty()) quality_face.quality_first = p.time + bracket_ns;
+        if (quality_face.quality_group.size() < 128)
+          quality_face.quality_group.push_back({p.alignment,
+            std::remainder(error + p.issued_correction, 2.0 * pi)});
+        quality_face.quality_last = p.time + bracket_ns;
+      }
       if (!std::isfinite(error) || std::abs(error) > 3.0 * pi / 180.0) {
         ++unmatched_; continue;
       }
@@ -143,6 +159,10 @@ public:
       f.last_matured = available;
     }
     for (auto & f : faces_) {
+      if (!f.quality_group.empty() && in.frame_ns - f.quality_last > cycle_gap_ns)
+        close_quality(f);
+      while (!f.quality_cycles.empty() && in.frame_ns - f.quality_cycles.front().time > age_ns)
+        f.quality_cycles.pop_front();
       if (!f.group.empty() && in.frame_ns - f.last_matured > cycle_gap_ns) close(f);
       while (!f.cycles.empty() && in.frame_ns - f.cycles.front().time > age_ns) {
         f.cycles.pop_front();
@@ -154,6 +174,31 @@ public:
     out.eligible = forecast && in.observations_valid && last_observation_ns_ == in.frame_ns;
     if (out.eligible) {
       const auto & face = faces_[in.face];
+      std::vector<double> passage_bounds;
+      for (const auto & c : face.quality_cycles) {
+        std::vector<double> errors;
+        double low = INFINITY, high = -INFINITY;
+        for (const auto & s : c.samples) {
+          if (!std::isfinite(s.alignment) || !std::isfinite(in.forecast_alignment_rad)) continue;
+          const double delta = std::remainder(s.alignment - in.forecast_alignment_rad, 2.0 * pi);
+          if (std::abs(delta) > 20.0 * pi / 180.0) continue;
+          low = std::min(low, delta); high = std::max(high, delta);
+          errors.push_back(std::abs(s.error));
+        }
+        if (errors.size() < 3 || low > 0.0 || high < 0.0) continue;
+        std::sort(errors.begin(), errors.end());
+        passage_bounds.push_back(errors[static_cast<std::size_t>(std::ceil(0.9 * errors.size())) - 1]);
+      }
+      out.quality_cycles = static_cast<int>(passage_bounds.size());
+      if (passage_bounds.size() >= 3) {
+        // Each passage contributes one tail error, regardless of frame count.
+        // This is empirical visual consistency, not a hit probability or a
+        // confidence interval for an independently measured projectile.
+        std::sort(passage_bounds.begin(), passage_bounds.end());
+        out.past_error_bound_rad = passage_bounds[
+          static_cast<std::size_t>(std::ceil(0.9 * passage_bounds.size())) - 1];
+        out.quality_ready = std::isfinite(out.past_error_bound_rad);
+      }
       const auto & cycles = face.cycles;
       out.model_revision = face.revision;
       out.cycles = static_cast<int>(cycles.size());
@@ -213,7 +258,8 @@ public:
     }
     if (forecast && in.observations_valid && last_observation_ns_ == in.frame_ns) {
       if (pending_.size() >= 256) { pending_.pop_front(); ++unmatched_; }
-      const Pending p{in.prediction_ns, in.face, in.raw_yaw_rad, in.forecast_alignment_rad};
+      const Pending p{in.prediction_ns, in.face, in.raw_yaw_rad, in.forecast_alignment_rad,
+        out.correction_rad};
       pending_.insert(std::upper_bound(pending_.begin(), pending_.end(), p.time,
         [](int64_t time, const Pending & v) { return time < v.time; }), p);
     }
@@ -223,7 +269,10 @@ public:
 private:
   static constexpr double pi = 3.14159265358979323846;
   static constexpr int64_t bracket_ns = 25000000, cycle_gap_ns = 250000000;
-  static constexpr int64_t age_ns = 8000000000LL, loss_ns = 150000000;
+  static constexpr int64_t age_ns = 8000000000LL, frame_gap_ns = 150000000;
+  // Keep high-speed calibration through short visibility gaps. A stalled
+  // processing stream still resets at 150ms; only observation loss gets 200ms.
+  static constexpr int64_t observation_loss_ns = 200000000;
   struct Observation { int64_t time; std::array<double, 2> xy; };
   struct Sample { double alignment, error; };
   struct Cycle { int64_t time; double value; std::vector<Sample> samples; };
@@ -234,8 +283,11 @@ private:
     std::vector<Sample> group;
     int64_t first_matured = 0, last_matured = 0;
     uint64_t revision = 0;
+    std::vector<Sample> quality_group;
+    std::deque<Cycle> quality_cycles;
+    int64_t quality_first = 0, quality_last = 0;
   };
-  struct Pending { int64_t time; int face; double yaw, alignment; };
+  struct Pending { int64_t time; int face; double yaw, alignment, issued_correction; };
   struct Anchor { double range, omega, delay, speed, horizon; };
   Config config_;
   std::array<Face, 4> faces_;
@@ -300,6 +352,15 @@ private:
     }
     if (f.cycles.size() > 32) f.cycles.pop_front();
     f.group.clear();
+  }
+  void close_quality(Face & f)
+  {
+    const int64_t center = f.quality_first + (f.quality_last - f.quality_first) / 2;
+    const double separation = anchor_ ? 0.75 * 2.0 * pi / std::abs(anchor_->omega) * 1e9 : 0.0;
+    if (f.quality_cycles.empty() || center - f.quality_cycles.back().time >= separation)
+      f.quality_cycles.push_back({center, 0.0, std::move(f.quality_group)});
+    while (f.quality_cycles.size() > 32) f.quality_cycles.pop_front();
+    f.quality_group.clear();
   }
   Output status() const
   {

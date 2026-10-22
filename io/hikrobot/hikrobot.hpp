@@ -20,12 +20,16 @@ public:
   explicit HikRobot(const std::string & config_path);
   ~HikRobot() override;
   void read(cv::Mat & img, std::chrono::steady_clock::time_point & timestamp) override;
+  void read_latest(cv::Mat & img, std::chrono::steady_clock::time_point & timestamp) override;
+  CameraFrameInfo frame_info() const override { return last_frame_info_; }
 
 private:
   struct CameraData
   {
     cv::Mat img;
     std::chrono::steady_clock::time_point timestamp;
+    uint64_t capture_sequence;
+    uint64_t sdk_frame_id;
   };
 
   double exposure_us_;
@@ -50,12 +54,16 @@ private:
   std::thread capture_thread_;
   std::atomic<bool> capturing_;
   std::atomic<bool> capture_quit_;
-  tools::ThreadSafeQueue<CameraData> queue_;
+  tools::CameraFrameQueue<CameraData> queue_;
+  uint64_t capture_sequence_ = 0;  // Capture thread only; survives SDK reconnects.
+  CameraFrameInfo last_frame_info_;  // Read thread only.
 
   int vid_, pid_;
 
   void capture_start();
   void capture_stop();
+  void read_frame(
+    cv::Mat & img, std::chrono::steady_clock::time_point & timestamp, bool prefer_latest);
 
   bool set_float_value(const std::string & name, double value);
   bool set_enum_value(const std::string & name, unsigned int value);

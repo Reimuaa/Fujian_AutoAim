@@ -49,6 +49,13 @@ void Camera::read(cv::Mat & img, std::chrono::steady_clock::time_point & timesta
   camera_->read(img, timestamp);
 }
 
+void Camera::read_latest(cv::Mat & img, std::chrono::steady_clock::time_point & timestamp)
+{
+  camera_->read_latest(img, timestamp);
+}
+
+CameraFrameInfo Camera::frame_info() const { return camera_->frame_info(); }
+
 uint64_t Camera::get_last_frame_id() const
 {
 #ifdef HAVE_GXIAPI

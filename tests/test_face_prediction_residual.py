@@ -100,7 +100,40 @@ void tests() {
       auto in=input(i); in.observations_valid=false; in.observations={};
       out=m.update(in); assert(!out.ready && out.correction_rad==0);
     }
-    assert(m.update(input(406)).correction_rad==0); // 150ms loss clears learning.
+    assert(m.update(input(406)).correction_rad==0); // Loss beyond 200ms clears learning.
+  }
+  for(int gap_ms : {150,199,200}) {
+    auto m=trained();
+    const auto before=m.update(input(381));
+    const auto last_seen=input(381).frame_ns;
+    // Keep processing frames while the armor is temporarily invisible.
+    for(int elapsed=10;elapsed<gap_ms;elapsed+=10) {
+      auto in=input(381+elapsed/10); in.observations_valid=false; in.observations={};
+      const auto out=m.update(in);
+      assert(!out.eligible && !out.ready && out.correction_rad==0);
+    }
+    auto resumed=input(381+gap_ms/10);
+    resumed.frame_ns=last_seen+gap_ms*1000000LL;
+    resumed.prediction_ns=resumed.frame_ns+500000000;
+    const auto out=m.update(resumed);
+    if(gap_ms<200) {
+      assert(out.ready && out.cycles==before.cycles);
+      assert(out.generation==before.generation);
+      assert(std::abs(out.correction_rad-before.correction_rad)<1e-12);
+    } else {
+      assert(!out.ready && out.cycles==0 && out.correction_rad==0);
+      assert(out.generation!=before.generation);
+    }
+  }
+  for(int gap_ms : {149,150}) {
+    auto m=trained();
+    // A processing pause is distinct from a visibility gap: retain its old limit.
+    auto in=input(381);
+    in.frame_ns=input(380).frame_ns+gap_ms*1000000LL;
+    in.prediction_ns=in.frame_ns+500000000;
+    const auto out=m.update(in);
+    assert(out.ready==(gap_ms<150));
+    if(gap_ms>=150) assert(out.correction_rad==0);
   }
   { Monitor a({true}), b({true});
     for(int i=0;i<=700;++i) {
@@ -365,7 +398,7 @@ def replay_inputs(frames):
     """Reconstruct inputs from current-frame fields only; never future labels."""
     rows = []
     for f in frames:
-        state = f.get("whole_ekf_state_at_frame")
+        state = f.get("prediction_state_at_frame") or f.get("whole_ekf_state_at_frame")
         point = f.get("native_xyza")
         valid_state = review.vector(state, 11)
         valid_point = review.vector(point, 4)
