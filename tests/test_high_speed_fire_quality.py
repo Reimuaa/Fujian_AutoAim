@@ -9,6 +9,134 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class HighSpeedFireQualityTests(unittest.TestCase):
+    def test_high_speed_pitch_trim_is_additive_and_keeps_non_high_unchanged(self):
+        source = (ROOT / "src/standard.cpp").read_text(encoding="utf-8")
+
+        def statement(start):
+            begin = source.index(start)
+            return source[begin:source.index(";", begin) + 1]
+
+        code = r'''
+#include <algorithm>
+#include <cassert>
+#include <cmath>
+#include <iostream>
+#include <yaml-cpp/yaml.h>
+double compensate(bool high_speed_mode,const char * yaml,double model_deg,double common_deg=0.) {
+  const auto integration_yaml=YAML::Load(yaml);
+  const double rad=M_PI/180.;
+  const double xuc_ballistic_pitch_trim_rad=common_deg*rad;
+CONFIG
+SELECTION
+  const double fixed_boresight_bias_rad=0.,camera_los_up_rad=0.;
+  const double xuc_ballistic_max_compensation_rad=20.*rad;
+  struct { double pitch; } current_trajectory{model_deg*rad};
+  double ballistic_pitch_compensation_rad=0.;
+COMPENSATION
+  return ballistic_pitch_compensation_rad/rad;
+}
+int main() {
+  const char * trim="xuc_high_speed_ballistic_pitch_trim_deg: -0.5";
+  for(double model:{1.,3.,8.})for(double common:{-.2,0.,.3}) {
+    const auto baseline=compensate(false,"{}",model,common);
+    assert(compensate(false,trim,model,common)==baseline);
+    assert(compensate(true,"{}",model,common)==baseline);
+    assert(std::abs(compensate(true,trim,model,common)-(baseline-.5))<1e-12);
+  }
+  assert(compensate(true,trim,.2)==0.); // Existing total-compensation bounds remain.
+  assert(std::abs(compensate(true,trim,25.)-20.)<1e-12);
+  assert(std::abs(compensate(true,"xuc_high_speed_ballistic_pitch_trim_deg: 999",2.)-7.)<1e-12);
+  std::cout<<"PASS production high-speed -0.5 degree pitch trim: additive, missing-key "
+    "compatibility, exact non-high isolation and original compensation limits\n";
+}
+'''
+        replacements = {
+            "CONFIG": statement("  const double xuc_high_speed_ballistic_pitch_trim_rad ="),
+            "SELECTION": statement("    const double effective_ballistic_pitch_trim_rad ="),
+            "COMPENSATION": statement("              ballistic_pitch_compensation_rad = std::clamp("),
+        }
+        code = "\n".join(replacements.get(line, line) for line in code.splitlines())
+        compile_run(code, "test_high_speed_pitch_trim", libraries=("yaml-cpp",))
+
+    def test_rotation_window_requires_history_and_preserves_other_gates(self):
+        source = (ROOT / "src/standard.cpp").read_text(encoding="utf-8")
+
+        def statement(start):
+            begin = source.index(start)
+            return source[begin:source.index(";", begin) + 1]
+
+        begin = source.index("struct RotationFireWindow")
+        window = source[begin:source.index("\n};", begin) + 3]
+        code = r'''
+#include <algorithm>
+#include <cassert>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <iostream>
+WINDOW
+struct Result { bool shoot, stable, point; };
+Result qualify(RotationFireWindow & rotation_fire_window, int seq,
+  unsigned blocked=0, bool valid=true, int face=0, double phase=0., double error=0.) {
+  const auto t=std::chrono::steady_clock::time_point(std::chrono::milliseconds(20*seq));
+  rotation_fire_window.update(valid,false,3,1,4,face,false,phase,error,t,2,
+    20.*M_PI/180.,.25*M_PI/180.,seq,0.,4.5,60./57.3,20./57.3);
+  auto passes=[&](int bit) { return !(blocked & (1u<<bit)); };
+  struct { bool inhibit_shoot,control,shoot=false; } command{!passes(0),passes(1)};
+  const bool auto_mode_active=passes(2),convergence_gate_open=passes(3);
+  const bool one_face_gate_open=passes(4),motion_transition_gate_open=passes(5);
+  const bool command_cadence_gate_open=passes(6),direct_yaw_measurement_fresh=passes(7);
+  const bool direct_pitch_measurement_fresh=passes(8),yaw_gate_open=passes(9);
+  const double direct_pitch_pixel_error_rad=passes(10)?0.:1.,xuc_fire_pitch_tolerance_rad=.02;
+  struct { bool open; } high_speed_pitch_quality{passes(11)};
+  const bool high_speed_prediction_quality_open=passes(12),prediction_yaw_gate_open=passes(13);
+  const bool high_speed_prediction_current_valid=passes(14);
+  const bool gyro_event_schedule_valid=false;
+CANDIDATE
+POINT
+  bool stable_window_open=false;
+STABLE
+REQUEST
+  return {command.shoot,stable_window_open,prediction_point_gate_open};
+}
+int main() {
+  RotationFireWindow initial;
+  assert(!qualify(initial,1).shoot);
+  assert(qualify(initial,2).shoot);
+  for(int gate=0;gate<15;++gate) {
+    RotationFireWindow w;
+    assert(!qualify(w,1).shoot);
+    assert(!qualify(w,2,1u<<gate).shoot);
+  }
+  RotationFireWindow w;
+  assert(!qualify(w,1).shoot);
+  assert(qualify(w,2).shoot);
+  assert(!qualify(w,3,0,false).shoot); // Invalid observations clear history.
+  assert(!qualify(w,4,0,true,-1).shoot);
+  assert(!qualify(w,5,0,true,0,NAN).shoot);
+  assert(!qualify(w,6,0,true,0,0.,NAN).shoot);
+  assert(!qualify(w,7,0,true,1).shoot); // A new face must rebuild two-frame history.
+  assert(qualify(w,8,0,true,1).shoot);
+  RotationFireWindow point_window;
+  const double rad=M_PI/180.;
+  assert(!qualify(point_window,1,0,true,0,0.,.2*rad).shoot);
+  const auto waiting=qualify(point_window,2,0,true,0,0.,.1*rad);
+  assert(waiting.stable && !waiting.point && !waiting.shoot);
+  assert(qualify(point_window,3,0,true,0,0.,0.).shoot);
+  std::cout<<"PASS production fixed rotation window: two-frame and best-frame waits, "
+    "invalid observations/face reset and 15 independent fire vetoes\n";
+}
+'''
+        replacements = {
+            "WINDOW": window,
+            "CANDIDATE": statement("      const bool fire_candidate ="),
+            "POINT": statement("      const bool prediction_point_gate_open ="),
+            "STABLE": statement("        stable_window_open = rotation_fire_window.two_frames_ready;"),
+            "REQUEST": statement("        command.shoot = stable_window_open && fire_candidate &&"),
+        }
+        code = "\n".join(replacements.get(line, line) for line in code.splitlines())
+        compile_run(code, "test_high_speed_rotation_window")
+
     def test_pitch_dwell_boundaries_and_past_only_forecast_quality(self):
         prefix = DRIVER[:DRIVER.index("void tests()")]
         compile_run(prefix + r'''
@@ -57,7 +185,7 @@ int main() {
 
   auto permits=[](const Monitor::Output & out) {
     return auto_aim::past_forecast_quality_allows(
-      true,out.quality_ready,out.eligible,out.past_error_bound_rad,.45*rad);
+      true,out.quality_ready,out.quality_eligible,out.past_error_bound_rad,.45*rad);
   };
 
   auto run=[&](double raw) {
@@ -100,10 +228,12 @@ int main() {
   for(bool high_speed_mode:{false,true})
     for(bool high_speed_prediction_quality_enabled:{false,true})
       for(bool gyro_model_fresh:{false,true})
-        for(int history=0;history<4;++history) {
+        for(int history=0;history<6;++history) {
           auto_aim::FacePredictionResidual::Output face_residual;
           face_residual.quality_ready=history>0;
-          face_residual.eligible=history!=2;
+          face_residual.eligible=history!=2 && history!=4 && history!=5;
+          face_residual.quality_eligible=history!=2 && history!=4;
+          face_residual.quality_retained=history==4;
           face_residual.past_error_bound_rad=history==3?.46*M_PI/180.:.1*M_PI/180.;
           double high_speed_prediction_quality_limit_rad=.45*M_PI/180.;
           bool high_speed_prediction_quality_active=false;
@@ -112,7 +242,11 @@ int main() {
           if(!high_speed_mode || !high_speed_prediction_quality_enabled || gyro_model_fresh)
             assert(high_speed_prediction_quality_open);
           else
-            assert(high_speed_prediction_quality_open==(history==1));
+            assert(high_speed_prediction_quality_open==(history==1 || history==4 || history==5));
+          const bool active=high_speed_mode && high_speed_prediction_quality_enabled && !gyro_model_fresh;
+          assert(high_speed_prediction_current_valid==(!active || (history!=2 && history!=4 && history!=5)));
+          if(active && (history==4 || history==5))
+            assert(!high_speed_prediction_current_valid); // Held or no current accepted observation.
         }
   std::cout<<"PASS production standard wiring: high-speed maturity; non-high/PLL/disabled bypass\n";
 }

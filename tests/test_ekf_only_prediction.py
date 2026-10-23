@@ -27,7 +27,7 @@ using namespace std::chrono;
 // stubs; the actual tracker config, association, target and filter code run.
 namespace auto_aim {
 Solver::Solver(const std::string &) {}
-void Solver::solve(Armor &) const {}
+void Solver::solve(Armor &, bool) const {}
 std::vector<cv::Point2f> Solver::reproject_armor(
   const Eigen::Vector3d &,double,ArmorType,ArmorName) const {
   return {{0,0},{100,0},{100,40},{0,40}};

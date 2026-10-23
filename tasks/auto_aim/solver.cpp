@@ -64,7 +64,7 @@ void Solver::set_R_gimbal2world(const Eigen::Quaterniond & q)
 }
 
 //solvePnP（获得姿态）
-void Solver::solve(Armor & armor) const
+void Solver::solve(Armor & armor, bool batch_projection) const
 {
   const auto & object_points =
     (armor.type == ArmorType::big) ? BIG_ARMOR_POINTS : SMALL_ARMOR_POINTS;
@@ -96,7 +96,8 @@ void Solver::solve(Armor & armor) const
                      armor.name == ArmorName::five);
   if (is_balance) return;
 
-  optimize_yaw(armor);
+  if (batch_projection) optimize_yaw_batched(armor);
+  else optimize_yaw(armor);
 }
 
 std::vector<cv::Point2f> Solver::reproject_armor(
@@ -225,6 +226,65 @@ void Solver::optimize_yaw(Armor & armor) const
     }
   }
 
+  armor.yaw_raw = armor.ypr_in_world[0];
+  armor.ypr_in_world[0] = best_yaw;
+}
+
+void Solver::optimize_yaw_batched(Armor & armor) const
+{
+  // Preserve the legacy 140 candidates, one-degree step, fixed tilt and
+  // sum of Point2f corner distances. Only projection work is batched.
+  constexpr int SEARCH_RANGE = 140;
+  const auto gimbal_ypr = tools::eulers(R_gimbal2world_, 2, 1, 0);
+  const double yaw0 = tools::limit_rad(gimbal_ypr[0] - SEARCH_RANGE / 2 * CV_PI / 180.0);
+  const auto & corners = armor.type == ArmorType::big ? BIG_ARMOR_POINTS : SMALL_ARMOR_POINTS;
+  const double pitch = (armor.name == ArmorName::outpost ? -15.0 : 15.0) * CV_PI / 180.0;
+  const double cp = std::cos(pitch), sp = std::sin(pitch);
+
+  // Legacy projection orthogonalizes each composed rotation through Rodrigues.
+  // Orthogonalize the common factor once: polar(A * R) = polar(A) * R.
+  const Eigen::Matrix3d raw_world_to_camera =
+    R_camera2gimbal_.transpose() * R_gimbal2world_.transpose();
+  cv::Mat rotation_matrix;
+  cv::eigen2cv(raw_world_to_camera, rotation_matrix);
+  cv::Vec3d rotation_vector;
+  cv::Rodrigues(rotation_matrix, rotation_vector);
+  cv::Rodrigues(rotation_vector, rotation_matrix);
+  Eigen::Matrix3d world_to_camera;
+  cv::cv2eigen(rotation_matrix, world_to_camera);
+  const Eigen::Vector3d translation = R_camera2gimbal_.transpose() *
+    (R_gimbal2world_.transpose() * armor.xyz_in_world - t_camera2gimbal_);
+
+  std::array<double, SEARCH_RANGE> yaws;
+  std::vector<cv::Point3d> camera_points;
+  camera_points.reserve(SEARCH_RANGE * 4);
+  for (int i = 0; i < SEARCH_RANGE; ++i) {
+    const double yaw = tools::limit_rad(yaw0 + i * CV_PI / 180.0);
+    yaws[i] = yaw;
+    const double cy = std::cos(yaw), sy = std::sin(yaw);
+    Eigen::Matrix3d rotation;
+    rotation << cy * cp, -sy, cy * sp, sy * cp, cy, sy * sp, -sp, 0.0, cp;
+    const Eigen::Matrix3d camera_rotation = world_to_camera * rotation;
+    for (const auto & corner : corners) {
+      const Eigen::Vector3d point = camera_rotation *
+        Eigen::Vector3d(corner.x, corner.y, corner.z) + translation;
+      camera_points.emplace_back(point.x(), point.y(), point.z());
+    }
+  }
+  std::vector<cv::Point2d> projected;
+  cv::projectPoints(camera_points, cv::Vec3d(0, 0, 0), cv::Vec3d(0, 0, 0),
+    camera_matrix_, distort_coeffs_, projected);
+  double min_error = 1e10;
+  double best_yaw = armor.ypr_in_world[0];
+  for (int i = 0; i < SEARCH_RANGE; ++i) {
+    double error = 0.0;
+    for (int j = 0; j < 4; ++j)
+      error += cv::norm(armor.points[j] - cv::Point2f(projected[i * 4 + j]));
+    if (error < min_error) {
+      min_error = error;
+      best_yaw = yaws[i];
+    }
+  }
   armor.yaw_raw = armor.ypr_in_world[0];
   armor.ypr_in_world[0] = best_yaw;
 }

@@ -17,6 +17,9 @@ int main(int argc,char **argv) {
   a.priority=auto_aim::ArmorPriority::first;a.xyz_in_world={3.3,0,.05};a.ypr_in_world={0,0,0};
   Eigen::VectorXd p(11);p.setOnes();auto_aim::YawESKF::Config yaw;yaw.enabled=false;
   auto_aim::Aimer aimer(argv[1]);int rescued=0,valid=0;
+  assert(!aimer.debug_aim_point.valid && aimer.debug_aim_point.xyza.isZero(0.));
+  assert(!aimer.aim({},steady_clock::now(),20.).control);
+  assert(!aimer.debug_aim_point.valid && aimer.debug_aim_point.xyza.isZero(0.));
   for(int sign:{-1,1}) for(int k=0;k<360;++k) {
     const auto t=steady_clock::now();auto_aim::Target base(a,t,.3,4,p,yaw);
     auto state=base.ekf().x;state[0]=3.6;state[2]=.05;state[4]=.05;

@@ -11,6 +11,9 @@ namespace auto_aim
 {
 // Active high-speed qualification requires mature evidence for the current
 // face/phase. Missing or reset history cannot authorize a new request.
+// "eligible" also accepts a briefly retained historical verdict. Production
+// checks current forecast eligibility and observation freshness separately;
+// a retained verdict alone must never authorize a request.
 inline bool past_forecast_quality_allows(
   bool active, bool ready, bool eligible, double bound_rad, double limit_rad)
 {

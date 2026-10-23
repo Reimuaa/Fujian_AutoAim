@@ -22,6 +22,7 @@ import analyze_prediction_debug as review
 
 DRIVER = r'''
 #include "tasks/auto_aim/face_prediction_residual.hpp"
+#include "tasks/auto_aim/high_speed_fire_quality.hpp"
 #include "tasks/auto_aim/rotation_model_manager.hpp"
 #include <cassert>
 #include <fstream>
@@ -93,6 +94,10 @@ void tests() {
     const auto out=m.update(in);
     assert(!out.ready && out.correction_rad==0);
     auto resumed=input(382);
+    if(test==3) {
+      assert(m.update(resumed).ready); // Short same-context outage only suspends output.
+      continue;
+    }
     assert(m.update(resumed).correction_rad==0); // Returning cannot reuse history.
   }
   { auto m=trained(); Monitor::Output out;
@@ -134,6 +139,169 @@ void tests() {
     const auto out=m.update(in);
     assert(out.ready==(gap_ms<150));
     if(gap_ms>=150) assert(out.correction_rad==0);
+  }
+  for(int gap_ms : {149,150,160}) {
+    Monitor m({true});
+    for(int tick=0;tick<=380;++tick) {
+      auto in=input(tick); in.forecast_alignment_rad=0;
+      m.update(in);
+    }
+    auto current=input(381); current.forecast_alignment_rad=0;
+    const auto before=m.update(current);
+    assert(before.quality_ready && before.quality_cycles==3);
+    const auto last_valid=input(381).frame_ns;
+    // Invalid frames keep arriving; the limit is measured from valid context,
+    // rather than allowing those frames to renew the retained history forever.
+    for(int elapsed=10;elapsed<gap_ms;elapsed+=10) {
+      auto in=input(381+elapsed/10); in.context_valid=false;
+      const auto out=m.update(in);
+      assert(!out.eligible && !out.quality_ready && !out.ready);
+      assert(out.correction_rad==0);
+      assert(!auto_aim::past_forecast_quality_allows(true,out.quality_ready,
+        out.quality_eligible,out.past_error_bound_rad,.45*rad));
+      if(elapsed<150) assert(out.generation==before.generation);
+      else assert(out.generation!=before.generation);
+    }
+    auto in=input(381+gap_ms/10);
+    in.frame_ns=last_valid+gap_ms*1000000LL;
+    in.prediction_ns=in.frame_ns+500000000;
+    in.forecast_alignment_rad=0;
+    const auto resumed=m.update(in);
+    assert(resumed.ready==(gap_ms<150));
+    assert(resumed.quality_ready==(gap_ms<150));
+    assert((resumed.generation==before.generation)==(gap_ms<150));
+  }
+  for(int hard_reset=0;hard_reset<5;++hard_reset) {
+    auto m=trained();
+    auto invalid=input(381); invalid.context_valid=false;
+    if(hard_reset==0) invalid.epoch=2;
+    if(hard_reset==1) invalid.rebuilt=true;
+    if(hard_reset==2) invalid.omega_rad_s=4.5;
+    if(hard_reset==3) invalid.high_speed_mode=false;
+    if(hard_reset==4) invalid.epoch=0;
+    const auto blocked=m.update(invalid);
+    assert(!blocked.eligible && !blocked.quality_ready);
+    const auto resumed=m.update(input(382));
+    assert(!resumed.ready && !resumed.quality_ready);
+  }
+  {
+    auto quality_input=[](int tick,double error_deg) {
+      auto in=input(tick); in.raw_yaw_rad=error_deg*rad;
+      in.observations[0].reset();
+      for(int center : {70,210,350})
+        if(std::abs(tick-center)<=2) in.observations[0]=std::array<double,2>{5.,0.};
+      in.forecast_alignment_rad=80*rad;
+      // The three completed passages sample overlapping nearby phase ranges.
+      // Only one individually brackets zero, but together they cover [-3,+3].
+      for(int passage=0;passage<3;++passage) {
+        const int offset=tick-(18+140*passage);
+        if(offset>=0 && offset<=4)
+          in.forecast_alignment_rad=((-3.+2.*passage)+.5*offset)*rad;
+      }
+      return in;
+    };
+    for(double error_deg : {.1,3.5}) {
+      Monitor m({true});
+      for(int tick=0;tick<=400;++tick) {
+        auto in=quality_input(tick,error_deg);
+        if(tick==260 || tick==400) in.forecast_alignment_rad=0;
+        const auto out=m.update(in);
+        if(tick==260) assert(!out.quality_ready && out.quality_cycles==2);
+        if(tick==400) assert(out.quality_ready && out.quality_cycles==3);
+      }
+      int tick=401;
+      for(double query : {-.5,0.,.5}) {
+        auto in=quality_input(tick++,error_deg); in.forecast_alignment_rad=query*rad;
+        const auto out=m.update(in);
+        assert(out.eligible && out.quality_ready && out.quality_cycles==3);
+        assert(auto_aim::past_forecast_quality_allows(true,out.quality_ready,
+          out.quality_eligible,out.past_error_bound_rad,.45*rad)==(error_deg<.45));
+      }
+      for(double query : {10.,30.,double(NAN)}) {
+        auto in=quality_input(tick++,error_deg); in.forecast_alignment_rad=query*rad;
+        assert(!m.update(in).quality_ready); // No extrapolation or missing-phase fallback.
+      }
+      auto other_face=quality_input(tick++,error_deg); other_face.face=1;
+      other_face.forecast_alignment_rad=0;
+      assert(!m.update(other_face).quality_ready);
+      // Retaining history never grants qualification to an invalid current frame.
+      auto invalid=quality_input(tick++,error_deg); invalid.context_valid=false;
+      assert(!m.update(invalid).quality_ready);
+      auto resumed=quality_input(tick++,error_deg); resumed.forecast_alignment_rad=0;
+      assert(m.update(resumed).quality_ready);
+      {
+        auto unavailable=m;
+        auto missing=quality_input(tick,error_deg); missing.forecast_valid=false;
+        missing.forecast_alignment_rad=0;
+        const auto out=unavailable.update(missing);
+        assert(!out.quality_eligible && out.quality_retained && out.quality_ready);
+        // An open historical verdict still cannot qualify a missing forecast.
+        assert(!(out.quality_eligible && auto_aim::past_forecast_quality_allows(true,
+          out.quality_ready,out.quality_eligible || out.quality_retained,
+          out.past_error_bound_rad,.45*rad)));
+        unavailable=m;
+        for(int elapsed=10;elapsed<=160;elapsed+=10) {
+          missing=quality_input(tick-1+elapsed/10,error_deg);
+          missing.forecast_valid=false; missing.observations_valid=false; missing.observations={};
+          const auto held=unavailable.update(missing);
+          assert(!held.quality_eligible && !held.eligible);
+          assert(held.quality_retained==(elapsed<150));
+          assert(held.quality_ready==(elapsed<150));
+        }
+        for(bool range_change : {false,true}) {
+          auto changed=m;
+          missing=quality_input(tick,error_deg); missing.forecast_valid=false;
+          if(range_change) missing.center_range_m=5.6;
+          else missing.omega_rad_s=-6.1;
+          assert(!changed.update(missing).quality_retained);
+        }
+      }
+      // Historical quality is not an observation gate. It remains applicable
+      // during a short visibility gap while current-frame corrections stop.
+      for(int gap_ms=10;gap_ms<=210;gap_ms+=10) {
+        auto hidden=quality_input(tick++,error_deg);
+        hidden.forecast_alignment_rad=0;
+        hidden.observations_valid=false; hidden.observations={};
+        const auto out=m.update(hidden);
+        assert(!out.eligible && !out.ready && out.correction_rad==0);
+        assert(out.quality_eligible==(gap_ms<200));
+        assert(out.quality_ready==(gap_ms<200));
+        assert(auto_aim::past_forecast_quality_allows(true,out.quality_ready,
+          out.quality_eligible,out.past_error_bound_rad,.45*rad)==
+            (gap_ms<200 && error_deg<.45));
+      }
+      auto fresh=quality_input(tick++,error_deg); fresh.forecast_alignment_rad=0;
+      assert(!m.update(fresh).quality_ready); // Stale history must mature again.
+    }
+    {
+      Monitor worsening({true});
+      for(int tick=0;tick<=540;++tick) {
+        auto in=quality_input(tick,tick>=430 ? 3.5 : .1);
+        if(std::abs(tick-490)<=2) in.observations[0]=std::array<double,2>{5.,0.};
+        if(tick>=438 && tick<=442) in.forecast_alignment_rad=(tick-440)*.5*rad;
+        if(tick==400 || tick==490 || tick==519) in.forecast_alignment_rad=0;
+        if(tick>=520) in.forecast_valid=false;
+        const auto out=worsening.update(in);
+        const bool permits=auto_aim::past_forecast_quality_allows(true,out.quality_ready,
+          out.quality_eligible || out.quality_retained,out.past_error_bound_rad,.45*rad);
+        if(tick==400 || tick==490 || tick==519) assert(permits && out.quality_cycles==3);
+        // As soon as the next independent bad passage matures, it closes an
+        // already-open gate; history retention is not a minimum-open timer.
+        if(tick==520 || tick==530) assert(!permits && out.quality_ready && out.quality_cycles==4 &&
+          out.quality_retained && !out.quality_eligible);
+      }
+    }
+    {
+      Monitor expiring({true}); Monitor::Output out;
+      for(int tick=0;tick<=880;++tick) {
+        auto in=quality_input(tick,.1); in.forecast_alignment_rad=0;
+        if(tick>868) in.forecast_valid=false;
+        out=expiring.update(in);
+        if(tick==868) assert(out.quality_ready && out.quality_cycles==3);
+      }
+      // Holding the query does not extend a completed passage's 8s lifetime.
+      assert(out.quality_retained && !out.quality_ready && out.quality_cycles==2);
+    }
   }
   { Monitor a({true}), b({true});
     for(int i=0;i<=700;++i) {
@@ -209,7 +377,7 @@ void tests() {
     for(int i=0;i<=1300;++i) {
       auto in=input(i); if(i>335) in.observations[0].reset();
       const auto out=m.update(in);
-      if(i==1300) assert(!out.ready); // 8s expiry despite another visible plate.
+      if(i==1300) assert(!out.ready && !out.quality_ready); // 8s expiry despite another visible plate.
     }
   }
   { auto m=trained();
@@ -372,6 +540,7 @@ class ProductionResidualTests(unittest.TestCase):
 WINDOW
 int main() {
   auto_aim::FacePredictionResidual::Output previous_face_residual;
+  struct { bool changed=false; } fixed_center_source;
   RotationFireWindow w;
   for(int frame=1;frame<=8;++frame) {
     auto face_residual=previous_face_residual;

@@ -31,7 +31,7 @@ public:
 
   void set_R_gimbal2world(const Eigen::Quaterniond & q);
 
-  void solve(Armor & armor) const;
+  void solve(Armor & armor, bool batch_projection = false) const;
 
   std::vector<cv::Point2f> reproject_armor(
     const Eigen::Vector3d & xyz_in_world, double yaw, ArmorType type, ArmorName name) const;
@@ -52,6 +52,7 @@ private:
   Eigen::Matrix3d R_gimbal2world_;
 
   void optimize_yaw(Armor & armor) const;
+  void optimize_yaw_batched(Armor & armor) const;
 
   double armor_reprojection_error(const Armor & armor, double yaw, const double & inclined) const;
   double SJTU_cost(

@@ -45,6 +45,7 @@ public:
 
   struct FrameDiagnostics
   {
+    bool high_speed_batch_projection = false;
     bool target_state_available = false;
     bool initialized_this_frame = false;
     bool update_attempted = false;
@@ -105,6 +106,11 @@ public:
   int primary_face_id() const;
   const Armor * primary_observation() const;
   const FrameDiagnostics & frame_diagnostics() const;
+  void set_high_speed_batch_projection(bool enabled)
+  {
+    // The independent stationary/low-speed ESKF/CV tracker keeps legacy poses.
+    high_speed_batch_projection_ = enabled && !yaw_eskf_config_.enabled;
+  }
 
   std::list<Target> track(
     std::list<Armor> & armors, std::chrono::steady_clock::time_point t,
@@ -142,6 +148,7 @@ private:
   ArmorPriority omni_target_priority_;
   double association_max_cost_;
   bool identity_fallback_enabled_ = false;
+  bool high_speed_batch_projection_ = false;
   double identity_fallback_max_cost_ = 0.75;
   int batch_max_observations_;
   double batch_min_omega_rad_s_;

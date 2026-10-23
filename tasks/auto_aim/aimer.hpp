@@ -64,7 +64,7 @@ struct EventAimPrediction
 class Aimer
 {
 public:
-  AimPoint debug_aim_point;
+  AimPoint debug_aim_point{false, Eigen::Vector4d::Zero()};
   explicit Aimer(const std::string & config_path);
   io::Command aim(
     std::list<Target> targets, std::chrono::steady_clock::time_point timestamp, double bullet_speed,

@@ -416,6 +416,11 @@ int main(int argc, char * argv[])
        ? std::clamp(
            integration_yaml["xuc_ballistic_pitch_trim_deg"].as<double>(), -5.0, 5.0)
        : 0.0) * M_PI / 180.0;
+  const double xuc_high_speed_ballistic_pitch_trim_rad =
+    (integration_yaml["xuc_high_speed_ballistic_pitch_trim_deg"]
+       ? std::clamp(
+           integration_yaml["xuc_high_speed_ballistic_pitch_trim_deg"].as<double>(), -5.0, 5.0)
+       : 0.0) * M_PI / 180.0;
   auto_aim::RobustRangeFilter::Config robust_range_config;
   robust_range_config.time_constant_s =
     integration_yaml["xuc_range_filter_tau_ms"]
@@ -1026,13 +1031,15 @@ int main(int argc, char * argv[])
     tools::logger()->info(
       "[XUC][POLICY] high_pitch_gate={} residual_deg={:.2f} tracking_deg={:.2f} "
       "variation_deg={:.2f} stable_ms={:.0f} prediction_quality={} max_past_error_deg={:.2f} "
-      "fixed_center_shadow={} fixed_center_prediction={}", high_speed_pitch_config.enabled,
+      "fixed_center_shadow={} fixed_center_prediction={} high_pitch_trim_deg={:.2f}",
+      high_speed_pitch_config.enabled,
       high_speed_pitch_config.residual_limit_rad * 180.0 / M_PI,
       high_speed_pitch_config.tracking_limit_rad * 180.0 / M_PI,
       high_speed_pitch_config.variation_limit_rad * 180.0 / M_PI,
       high_speed_pitch_stable_ms, high_speed_prediction_quality_enabled,
       high_speed_prediction_quality_limit_rad * 180.0 / M_PI,
-      high_speed_fixed_center_shadow_enabled, high_speed_fixed_center_prediction_enabled);
+      high_speed_fixed_center_shadow_enabled, high_speed_fixed_center_prediction_enabled,
+      xuc_high_speed_ballistic_pitch_trim_rad * 180.0 / M_PI);
   }
   // 🎯 所有模块初始化完成，启动相机触发
   tools::logger()->info("=== All modules initialized ===");
@@ -1443,6 +1450,10 @@ int main(int argc, char * argv[])
     // recorder.record(img, q, t);
     Eigen::Vector3d ypr = tools::eulers(solver.R_gimbal2world(), 2, 1, 0);
 
+    // Like latest-frame capture, use the previous classification for this update.
+    // Without an independent non-high tracker, leave shared pose solving unchanged.
+    configured_tracker.set_high_speed_batch_projection(
+      legacy_tracker != nullptr && high_speed_camera_mode);
     auto targets = configured_tracker.track(armors, t);
     // Classify from the unchanged configured chain, even while legacy output is selected.
     const bool configured_model_trusted = !targets.empty() &&
@@ -2000,6 +2011,9 @@ int main(int argc, char * argv[])
     double direct_pitch_pixel_error_rad = INFINITY;
     double direct_pitch_raw_pixel_error_rad = INFINITY;
     double ballistic_pitch_compensation_rad = 0.0;
+    const double effective_ballistic_pitch_trim_rad = high_speed_mode
+      ? xuc_ballistic_pitch_trim_rad + xuc_high_speed_ballistic_pitch_trim_rad
+      : xuc_ballistic_pitch_trim_rad;
     double ballistic_camera_range_m = NAN;
     double ballistic_total_holdover_m = 0.0;
     // A newly constructed tracker returns provisional targets before its
@@ -2195,7 +2209,7 @@ int main(int argc, char * argv[])
                 reference_measured_compensation_rad - reference_trajectory.pitch;
               ballistic_pitch_compensation_rad = std::clamp(
                 fixed_boresight_bias_rad + current_trajectory.pitch - camera_los_up_rad +
-                  xuc_ballistic_pitch_trim_rad,
+                  effective_ballistic_pitch_trim_rad,
                 0.0,
                 xuc_ballistic_max_compensation_rad);
               ballistic_total_holdover_m =
@@ -2661,8 +2675,13 @@ int main(int argc, char * argv[])
         high_speed_prediction_quality_enabled && !gyro_model_fresh;
       high_speed_prediction_quality_open = auto_aim::past_forecast_quality_allows(
         high_speed_prediction_quality_active, face_residual.quality_ready,
-        face_residual.eligible, face_residual.past_error_bound_rad,
+        face_residual.quality_eligible || face_residual.quality_retained,
+        face_residual.past_error_bound_rad,
         high_speed_prediction_quality_limit_rad);
+      // Retained historical quality is not a current solution. Keep the
+      // original forecast AND current accepted-observation requirement.
+      const bool high_speed_prediction_current_valid =
+        !high_speed_prediction_quality_active || face_residual.eligible;
       const bool fire_candidate = !command.inhibit_shoot && command.control &&
         auto_mode_active &&
         convergence_gate_open && one_face_gate_open && motion_transition_gate_open &&
@@ -2670,7 +2689,8 @@ int main(int argc, char * argv[])
         direct_yaw_measurement_fresh && direct_pitch_measurement_fresh &&
         yaw_gate_open &&
         std::abs(direct_pitch_pixel_error_rad) <= xuc_fire_pitch_tolerance_rad &&
-        high_speed_pitch_quality.open && high_speed_prediction_quality_open;
+        high_speed_pitch_quality.open && high_speed_prediction_quality_open &&
+        high_speed_prediction_current_valid;
       bool stable_window_open = false;
       // Fire-gate diagnostic for both medium-speed prediction and the high-speed
       // event clock; low-speed dead zones were previously invisible here.
@@ -2856,12 +2876,14 @@ int main(int argc, char * argv[])
       tools::logger()->info(
         "[HIGH_QUALITY] pitch_open={} residual_deg={:+.3f} tracking_deg={:+.3f} "
         "variation_deg={:.3f} stable_ms={:.0f} prediction_open={} quality_ready={} "
+        "prediction_current={} prediction_held={} "
         "cycles={} past_error_deg={:.3f} fixed_center_shadow_ready={} shadow_us={:.0f}",
         high_speed_pitch_quality.open, direct_pitch_pixel_error_rad * RAD2DEG,
         high_speed_pitch_tracking_error_rad * RAD2DEG,
         high_speed_pitch_quality.variation_rad * RAD2DEG,
         high_speed_pitch_quality.stable_span_ns / 1e6, high_speed_prediction_quality_open,
-        face_residual.quality_ready, face_residual.quality_cycles,
+        face_residual.quality_ready, face_residual.eligible,
+        face_residual.quality_retained, face_residual.quality_cycles,
         face_residual.past_error_bound_rad * RAD2DEG, fixed_center_shadow.ready,
         fixed_center_compute_us);
     }
@@ -3538,6 +3560,7 @@ int main(int argc, char * argv[])
           {"shoot_low_ms", xuc.shoot_low_ms(command.high_speed_shoot)},
           {"yaw_eskf_enabled", yaw_eskf_enabled},
           {"yaw_prediction_source", yaw_prediction_source},
+          {"high_speed_batch_projection", tracker.frame_diagnostics().high_speed_batch_projection},
           {"yaw_model_trusted", yaw_motion_model_trusted},
           {"legacy_stationary_low_speed", legacy_tracker_active},
           {"rotation_mode_trusted", rotation_model.tracker_trusted},
@@ -3613,6 +3636,9 @@ int main(int argc, char * argv[])
           {"high_speed_prediction_quality", {
             {"active", high_speed_prediction_quality_active},
             {"open", high_speed_prediction_quality_open},
+            {"eligible", face_residual.quality_eligible},
+            {"retained", face_residual.quality_retained},
+            {"current_valid", face_residual.eligible},
             {"ready", face_residual.quality_ready}, {"cycles", face_residual.quality_cycles},
             {"past_error_bound_rad", number(face_residual.past_error_bound_rad)},
             {"limit_rad", high_speed_prediction_quality_limit_rad}}},

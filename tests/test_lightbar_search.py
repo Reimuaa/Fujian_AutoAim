@@ -49,7 +49,8 @@ def compile_run(code, name, *, sources=(), libraries=(), fixtures=None, argument
             compiler = shutil.which("cl.exe", path=env.get("PATH"))
             if not compiler:
                 raise RuntimeError("MSVC compiler unavailable")
-            lib_names = {"opencv_core": "opencv_core4", "opencv_imgproc": "opencv_imgproc4"}
+            lib_names = {"opencv_core": "opencv_core4", "opencv_imgproc": "opencv_imgproc4",
+                         "opencv_calib3d": "opencv_calib3d4"}
             command = [compiler, "/nologo", "/std:c++17", "/EHsc", "/utf-8", "/O2", "/MD",
                        "/D_USE_MATH_DEFINES", "/DNOMINMAX", "/DFMT_SHARED", "/DSPDLOG_SHARED_LIB",
                        "/DSPDLOG_COMPILED_LIB", "/DSPDLOG_FMT_EXTERNAL", "/DWIN32_LEAN_AND_MEAN",

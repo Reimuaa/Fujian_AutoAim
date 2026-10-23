@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 class StationaryLowSpeedRestoreTests(unittest.TestCase):
     def test_real_trackers_keep_high_speed_state_and_restore_legacy_prediction(self):
         source = (ROOT / "src/standard.cpp").read_text(encoding="utf-8")
-        begin = source.index("    auto targets = configured_tracker.track(armors, t);")
+        begin = source.index("    configured_tracker.set_high_speed_batch_projection(")
         selection = source[begin:source.index("    if (roi_reacquisition_enabled)", begin)]
         code = r'''
 #include <cassert>
@@ -24,7 +24,8 @@ class StationaryLowSpeedRestoreTests(unittest.TestCase):
 using namespace std::chrono;
 namespace auto_aim {
 Solver::Solver(const std::string &) {}
-void Solver::solve(Armor &) const {}
+int batch_projection_calls=0;
+void Solver::solve(Armor &, bool batch) const { if(batch) ++batch_projection_calls; }
 std::vector<cv::Point2f> Solver::reproject_armor(
  const Eigen::Vector3d &,double,ArmorType,ArmorName) const {
  return {{0,0},{100,0},{100,40},{0,40}};
@@ -50,6 +51,8 @@ void same_targets(const std::list<auto_aim::Target> & a,const std::list<auto_aim
 void run(const char * off,const char * on,bool restore) {
  auto_aim::Solver solver(off);
  auto_aim::Tracker configured_tracker(off,solver),high_reference(off,solver),legacy_reference(on,solver);
+ legacy_reference.set_high_speed_batch_projection(true); // ESKF must reject opting in.
+ const int batch_calls_before=auto_aim::batch_projection_calls;
  std::unique_ptr<auto_aim::Tracker> legacy_tracker;
  if(restore)legacy_tracker=std::make_unique<auto_aim::Tracker>(off,solver,true);
  auto_aim::RotationModelManager::Config cfg;cfg.high_speed_phase_enabled=false;
@@ -75,6 +78,7 @@ SELECTION
   if(diag.state_after.size())assert((diag.state_after-reference_diag.state_after).norm()<1e-12);
   assert(diag.yaw_eskf_accepted==0 && !diag.yaw_eskf_enabled);
   if(legacy_tracker_active) {
+   assert(!tracker.frame_diagnostics().high_speed_batch_projection);
    const auto expected=legacy_reference.track(legacy_input,t);same_targets(targets,expected);
    ++legacy_checks;
    if(!targets.empty() && targets.front().armor_motion_trusted(targets.front().last_id))++cv_checks;
@@ -104,6 +108,8 @@ SELECTION
   }
  }
  assert(high_checks>50);
+ if(restore) assert(auto_aim::batch_projection_calls>batch_calls_before);
+ else assert(auto_aim::batch_projection_calls==batch_calls_before);
  if(restore)assert(legacy_checks>100 && cv_checks>100 && aim_checks>100);
  else assert(legacy_checks==0);
  std::cout<<"PASS restored="<<restore<<" legacy="<<legacy_checks<<" cv="<<cv_checks

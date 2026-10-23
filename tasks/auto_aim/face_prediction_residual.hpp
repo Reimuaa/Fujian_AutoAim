@@ -54,6 +54,12 @@ public:
     uint64_t model_revision = 0;
     // Past issued (already corrected) forecasts, scored only after their full
     // future reference bracket and an independent passage have completed.
+    // History applicability survives a brief visibility gap; current-frame
+    // correction eligibility and the observation/fire interlocks stay separate.
+    bool quality_eligible = false;
+    // A recent historical query can be retained through a missing forecast,
+    // but must never authorize one: quality_eligible remains false while held.
+    bool quality_retained = false;
     bool quality_ready = false;
     int quality_cycles = 0;
     double past_error_bound_rad = NAN;
@@ -86,11 +92,25 @@ public:
     const bool context = timed && in.context_valid && in.high_speed_mode && in.epoch != 0 &&
       std::isfinite(in.omega_rad_s) && std::abs(in.omega_rad_s) > 0.1 &&
       std::isfinite(in.center_range_m) && in.center_range_m > 0.0;
-    if (!context) { clear(); last_frame_ns_ = in.frame_ns; return status(); }
+    if (!context) {
+      // A short qualification outage is not a new physical target. Keep the
+      // learned history, but never make an invalid current frame eligible.
+      const bool same_context = timed && in.high_speed_mode && !in.rebuilt &&
+        in.epoch != 0 && in.epoch == epoch_ &&
+        std::isfinite(in.omega_rad_s) && sign_ * in.omega_rad_s > 0.0 &&
+        std::isfinite(in.center_range_m) && in.center_range_m > 0.0 &&
+        last_context_ns_ > 0 && in.frame_ns - last_context_ns_ < frame_gap_ns &&
+        (!last_frame_ns_ || in.frame_ns - last_frame_ns_ < frame_gap_ns);
+      if (!same_context) clear();
+      last_frame_ns_ = in.frame_ns;
+      return status();
+    }
     const int sign = in.omega_rad_s > 0.0 ? 1 : -1;
     if (in.rebuilt || epoch_ != in.epoch || sign_ != sign ||
-        (last_frame_ns_ && in.frame_ns - last_frame_ns_ >= frame_gap_ns)) clear();
+        (last_frame_ns_ && in.frame_ns - last_frame_ns_ >= frame_gap_ns) ||
+        (last_context_ns_ && in.frame_ns - last_context_ns_ >= frame_gap_ns)) clear();
     last_frame_ns_ = in.frame_ns;
+    last_context_ns_ = in.frame_ns;
     epoch_ = in.epoch;
     sign_ = sign;
 
@@ -172,26 +192,48 @@ public:
 
     Output out = status();
     out.eligible = forecast && in.observations_valid && last_observation_ns_ == in.frame_ns;
-    if (out.eligible) {
-      const auto & face = faces_[in.face];
+    out.quality_eligible = forecast && last_observation_ns_ > 0 &&
+      in.frame_ns - last_observation_ns_ < observation_loss_ns;
+    if (out.quality_eligible) {
+      last_quality_query_ = QualityQuery{in.frame_ns, in.face, in.forecast_alignment_rad};
+    } else if (!forecast && last_quality_query_ && last_observation_ns_ > 0 && anchor_ &&
+        in.frame_ns - last_quality_query_->time < frame_gap_ns &&
+        in.frame_ns - last_observation_ns_ < observation_loss_ns &&
+        std::abs(in.center_range_m - anchor_->range) <= 0.5 &&
+        std::abs(in.omega_rad_s - anchor_->omega) <= 1.5) {
+      // Do not renew the query time. Retain only the last queried face/phase;
+      // recompute its quality so expiry and newly matured bad evidence still
+      // close the gate immediately. This is not a minimum-open timer.
+      out.quality_retained = true;
+    }
+    if (out.quality_eligible || out.quality_retained) {
+      const auto & query = *last_quality_query_;
+      const auto & face = faces_[query.face];
       std::vector<double> passage_bounds;
+      double coverage_low = INFINITY, coverage_high = -INFINITY;
       for (const auto & c : face.quality_cycles) {
         std::vector<double> errors;
         double low = INFINITY, high = -INFINITY;
         for (const auto & s : c.samples) {
-          if (!std::isfinite(s.alignment) || !std::isfinite(in.forecast_alignment_rad)) continue;
-          const double delta = std::remainder(s.alignment - in.forecast_alignment_rad, 2.0 * pi);
+          if (!std::isfinite(s.alignment) || !std::isfinite(query.alignment)) continue;
+          const double delta = std::remainder(s.alignment - query.alignment, 2.0 * pi);
           if (std::abs(delta) > 20.0 * pi / 180.0) continue;
           low = std::min(low, delta); high = std::max(high, delta);
           errors.push_back(std::abs(s.error));
         }
-        if (errors.size() < 3 || low > 0.0 || high < 0.0) continue;
+        if (errors.size() < 3) continue;
+        coverage_low = std::min(coverage_low, low);
+        coverage_high = std::max(coverage_high, high);
         std::sort(errors.begin(), errors.end());
         passage_bounds.push_back(errors[static_cast<std::size_t>(std::ceil(0.9 * errors.size())) - 1]);
       }
       out.quality_cycles = static_cast<int>(passage_bounds.size());
-      if (passage_bounds.size() >= 3) {
+      if (passage_bounds.size() >= 3 && coverage_low <= 0.0 && coverage_high >= 0.0) {
         // Each passage contributes one tail error, regardless of frame count.
+        // Nearby independent passages jointly bracket the query. Requiring
+        // each sampled passage to bracket it made tiny phase changes discard
+        // mature evidence. Keep the +/-20deg neighbourhood and require pooled
+        // coverage on both sides, so quality is not extrapolated beyond it.
         // This is empirical visual consistency, not a hit probability or a
         // confidence interval for an independently measured projectile.
         std::sort(passage_bounds.begin(), passage_bounds.end());
@@ -199,6 +241,9 @@ public:
           static_cast<std::size_t>(std::ceil(0.9 * passage_bounds.size())) - 1];
         out.quality_ready = std::isfinite(out.past_error_bound_rad);
       }
+    }
+    if (out.eligible) {
+      const auto & face = faces_[in.face];
       const auto & cycles = face.cycles;
       out.model_revision = face.revision;
       out.cycles = static_cast<int>(cycles.size());
@@ -289,13 +334,15 @@ private:
   };
   struct Pending { int64_t time; int face; double yaw, alignment, issued_correction; };
   struct Anchor { double range, omega, delay, speed, horizon; };
+  struct QualityQuery { int64_t time; int face; double alignment; };
   Config config_;
   std::array<Face, 4> faces_;
   std::deque<Pending> pending_;
   std::optional<Anchor> anchor_;
+  std::optional<QualityQuery> last_quality_query_;
   uint64_t epoch_ = 0, generation_ = 0, matched_ = 0, unmatched_ = 0;
   int sign_ = 0;
-  int64_t last_frame_ns_ = 0, last_observation_ns_ = 0;
+  int64_t last_frame_ns_ = 0, last_observation_ns_ = 0, last_context_ns_ = 0;
 
   static double median(std::vector<double> values)
   {
@@ -375,10 +422,14 @@ private:
     faces_ = {};
     pending_.clear();
     anchor_.reset();
+    last_quality_query_.reset();
     last_observation_ns_ = 0;
     ++generation_;
   }
-  void clear() { clear_history(); epoch_ = 0; sign_ = 0; last_frame_ns_ = 0; }
+  void clear()
+  {
+    clear_history(); epoch_ = 0; sign_ = 0; last_frame_ns_ = 0; last_context_ns_ = 0;
+  }
 };
 }  // namespace auto_aim
 #endif

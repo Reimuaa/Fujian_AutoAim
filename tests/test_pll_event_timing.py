@@ -56,6 +56,9 @@ bool qualify(auto_aim::Aimer & aimer, const auto_aim::Target & target,
   const bool motion_transition_gate_open=gates.motion, command_cadence_gate_open=gates.cadence;
   const bool auto_mode_active=gates.auto_mode, xuc_imu_sync_valid=gates.imu;
   const double direct_pitch_pixel_error_rad=gates.pitch, xuc_fire_pitch_tolerance_rad=.02;
+  struct { bool open=true; } high_speed_pitch_quality;
+  const bool high_speed_prediction_quality_open=true; // PLL bypasses non-PLL history quality.
+  const bool high_speed_prediction_current_valid=true; // The current-forecast veto is also non-PLL only.
   io::Command command{gates.control,false,0.,0.}; command.inhibit_shoot=gates.inhibit;
   struct { bool enabled() const { return true; } } xuc;
   struct {

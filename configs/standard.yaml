@@ -158,11 +158,12 @@ leaving_angle: 20
 
 decision_speed: 0.8
 # Explicit motion-mode delays; changing high speed must not alter low speed.
-# High speed is now 370 ms with the 0.2 deg gate: 30 ms more lead than the
-# original 340, i.e. ~7.8 deg earlier at 4.6 rad/s. Low/stationary stay 330 ms.
+# High speed is now 335 ms with the 0.1 deg gate and 23 m/s projectile speed:
+# 5 ms less lead than the original 340 (~1.3 deg later at 4.6 rad/s).
+# Stationary stays 330 ms; low speed is now 320 ms.
 stationary_delay_time: 0.330
-high_speed_delay_time: 0.370
-low_speed_delay_time: 0.330
+high_speed_delay_time: 0.335
+low_speed_delay_time: 0.320
 
 actuation_delay_ms: 0
 
@@ -251,7 +252,7 @@ xuc_heartbeat_hz: 40.0             # 独立于相机；发送合法CRC包，正�
 xuc_target_confirm_frames: 3        # 连续有效观测，有限yaw/pitch，才允许control=1
 xuc_target_loss_ms: 150.0           # 短暂丢失保持上次有效角度且禁发；超时control=0恢复MCU扫描
 xuc_shoot_low_ms: 50.0             # 静止/低速：保持原低电平释放50ms，无额外请求间隔
-xuc_high_speed_shoot_low_ms: 100.0  # 仅高速：按请求时模式锁存低电平释放100ms，另需满足高速最小请求间隔
+xuc_high_speed_shoot_low_ms: 800.0  # 仅高速：按请求时模式锁存低电平释放800ms（原100ms），即每发后至少0.8s才能再请求
 # shoot=1只发送一个数据包，下一包恢复0；不再按100ms保持高电平。
 # control=0无有效目标/恢复MCU扫描，1有效目标接管，2显式请求REAL返程。
 xuc_fire_guard_enabled: true       # require fresh measured armor in both axes
@@ -263,7 +264,7 @@ xuc_high_speed_pitch_gate_enabled: true
 xuc_high_speed_pitch_tolerance_deg: 0.45
 xuc_high_speed_pitch_tracking_tolerance_deg: 0.8
 xuc_high_speed_pitch_variation_deg: 0.15
-xuc_high_speed_pitch_stable_ms: 30.0
+xuc_high_speed_pitch_stable_ms: 0.0
 # Empirical same-face/nearby-phase error of forecasts as actually issued.
 xuc_high_speed_prediction_quality_enabled: true
 xuc_high_speed_prediction_quality_max_error_deg: 0.45
@@ -310,7 +311,8 @@ xuc_gyro_require_event_lock_for_fire: true
 # Stationary pixel gates and the independent high-speed gate below are unchanged.
 xuc_gyro_predicted_yaw_tolerance_deg: 0.4
 # High-speed-only gate; the previous key remains the accepted low-speed gate.
-xuc_high_speed_predicted_yaw_tolerance_deg: 0.2
+# 0.1 is the parser's lower clamp bound, so this is the tightest legal value.
+xuc_high_speed_predicted_yaw_tolerance_deg: 0.1
 xuc_gyro_predicted_yaw_trim_deg: 0.0
 # Past-only same-face forecast residual; only in the selected high_speed mode.
 # Flat model: >=3 completed passages, 8s history, bounded +/-0.3deg; high speed only.
@@ -344,7 +346,7 @@ xuc_direct_pitch_filter_tau_ms: 60.0     # retain post-shot noise damping withou
 xuc_direct_pitch_hold_ms: 180.0          # 已保存双轴验收值：短丢帧保持
 xuc_direct_pitch_max_rate_dps: 45.0      # midpoint between the stable-but-slow 25 and previously validated 80 deg/s
 xuc_direct_pitch_error_gain: 1.35        # 弹道偏高单变量复测：与2.0对照，其余参数保持不变
-xuc_projectile_speed_mps: 20.0           # 弹道模型试验值，尚未测速；仅用静止靶对照
+xuc_projectile_speed_mps: 23.0           # 用户确认当前弹速 23 m/s；弹道俯仰与事件飞行时间用它
 xuc_ballistic_reference_projectile_speed_mps: 10.0  # 0.91m/17cm实弹基准采集于2500rpm，禁止随当前转速重算
 xuc_ballistic_pitch_enabled: true   # XUC直接俯仰弹道补偿开启；对照28m/s试验值
 xuc_camera_forward_of_muzzle_m: 0.06     # 实测：相机中心在炮口前方 6 cm
@@ -353,6 +355,7 @@ xuc_ballistic_reference_camera_range_m: 0.91
 xuc_ballistic_reference_total_drop_m: 0.08639  # physical 10m/s reference; zero fixed boresight bias
 xuc_ballistic_max_compensation_deg: 20.0    # 低弹速远距离补偿上限；下位机另保留25°/28°双层保护
 xuc_ballistic_pitch_trim_deg: 0.0       # 取消固定俯仰微调，仅保留原有弹道补偿
+xuc_high_speed_ballistic_pitch_trim_deg: -0.5  # 仅高速叠加固定P补偿；静止/低速仍用共用0°
 # Robust shared range for ballistic elevation and gyro time-of-flight.  The
 # rigid-body near-face range is authoritative; raw PnP depth contributes only a
 # bounded 5% correction so oblique plates cannot move the aim by metres.
