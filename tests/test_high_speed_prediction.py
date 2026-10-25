@@ -36,7 +36,7 @@ int main(int argc,char **argv) {
     assert((base.ekf().x-before).norm()==0);
     if(c.control) {
       ++valid;assert(trace.valid && trace.converged && trace.face_id>=0 && trace.face_id<4);
-      assert(std::abs(trace.flight_time_s-trace.flight_time_used_s)<.001);
+      assert(std::abs(trace.flight_time_s-trace.flight_time_used_s)<auto_aim::high_speed_flight_tolerance_s);
       auto future=*fixed;future.predict(steady_clock::time_point(nanoseconds(trace.prediction_ns)));
       const auto selected=future.whole_ekf_armor_xyza_list()[trace.face_id];
       assert((selected-aimer.debug_aim_point.xyza).norm()<1e-10);

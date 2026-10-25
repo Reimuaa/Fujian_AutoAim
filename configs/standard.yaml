@@ -70,7 +70,7 @@ yolo26_color_hold_frames: 20
 detector_debug: false
 # 排查时改为 true：记录帧/IMU、检测、跟踪、双轴指令及反馈，最多 3000 条摘要和 20 张丢失画面。
 # 正式运行保持 false，避免同步刷盘和图片编码影响下一帧。
-infantry_diagnostics_enabled: true
+infantry_diagnostics_enabled: false
 
 use_traditional: true
 # YOLO26 previously ignored use_traditional.  The adaptive two-light-bar
@@ -158,11 +158,13 @@ leaving_angle: 20
 
 decision_speed: 0.8
 # Explicit motion-mode delays; changing high speed must not alter low speed.
-# High speed is now 335 ms with the 0.1 deg gate and 23 m/s projectile speed:
-# 5 ms less lead than the original 340 (~1.3 deg later at 4.6 rad/s).
+# High-speed directions are viewed from above: CW negative omega, CCW positive.
+# The common value remains the fallback; only explicit high speed uses CW/CCW.
 # Stationary stays 330 ms; low speed is now 320 ms.
 stationary_delay_time: 0.330
-high_speed_delay_time: 0.335
+high_speed_delay_time: 0.365
+high_speed_delay_time_cw: 0.385   # 顺时针高速：380 ms（俯视目标）
+high_speed_delay_time_ccw: 0.325   # 逆时针高速：325 ms（俯视目标）
 low_speed_delay_time: 0.320
 
 actuation_delay_ms: 0
@@ -251,8 +253,10 @@ xuc_allow_shoot: true               # 弹道偏高实弹测量；由现场操作
 xuc_heartbeat_hz: 40.0             # 独立于相机；发送合法CRC包，正常调度下高于20Hz
 xuc_target_confirm_frames: 3        # 连续有效观测，有限yaw/pitch，才允许control=1
 xuc_target_loss_ms: 150.0           # 短暂丢失保持上次有效角度且禁发；超时control=0恢复MCU扫描
+xuc_target_death_return_enabled: true # 到位mode=1且确认见过亮灯靶后，持续无检测请求返航
+xuc_target_death_missing_ms: 1500.0 # 连续新鲜全画面无目标确认；500-10000ms；单进程仅触发一次
 xuc_shoot_low_ms: 50.0             # 静止/低速：保持原低电平释放50ms，无额外请求间隔
-xuc_high_speed_shoot_low_ms: 800.0  # 仅高速：按请求时模式锁存低电平释放800ms（原100ms），即每发后至少0.8s才能再请求
+xuc_high_speed_shoot_low_ms: 1000.0 # 仅高速：首个shoot=0包成功写出后保持释放至少1000ms；请求时锁存模式
 # shoot=1只发送一个数据包，下一包恢复0；不再按100ms保持高电平。
 # control=0无有效目标/恢复MCU扫描，1有效目标接管，2显式请求REAL返程。
 xuc_fire_guard_enabled: true       # require fresh measured armor in both axes
@@ -278,6 +282,7 @@ xuc_gyro_omega_threshold_rad_s: 0.8
 # Enable the optional PLL predictor only for the high_speed field trial.
 xuc_high_speed_phase_enabled: false
 xuc_high_speed_latest_frame_enabled: true # 仅已分类高速的下一次取图选最新帧；低速/静止仍保留最早待处理帧
+xuc_high_speed_packet_receive_enabled: true # 仅高速按30字节反馈包边界取数，避免等待凑满64字节；false恢复原收包策略
 xuc_vehicle_model_enter_rad_s: 0.8
 xuc_vehicle_model_exit_rad_s: 0.45
 xuc_high_speed_enter_rad_s: 3.2
@@ -355,7 +360,7 @@ xuc_ballistic_reference_camera_range_m: 0.91
 xuc_ballistic_reference_total_drop_m: 0.08639  # physical 10m/s reference; zero fixed boresight bias
 xuc_ballistic_max_compensation_deg: 20.0    # 低弹速远距离补偿上限；下位机另保留25°/28°双层保护
 xuc_ballistic_pitch_trim_deg: 0.0       # 取消固定俯仰微调，仅保留原有弹道补偿
-xuc_high_speed_ballistic_pitch_trim_deg: -0.5  # 仅高速叠加固定P补偿；静止/低速仍用共用0°
+xuc_high_speed_ballistic_pitch_trim_deg: -1.0  # 仅高速叠加固定P补偿；静止/低速仍用共用0°
 # Robust shared range for ballistic elevation and gyro time-of-flight.  The
 # rigid-body near-face range is authoritative; raw PnP depth contributes only a
 # bounded 5% correction so oblique plates cannot move the aim by metres.

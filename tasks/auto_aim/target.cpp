@@ -516,6 +516,24 @@ std::vector<Eigen::Vector4d> Target::whole_ekf_armor_xyza_list() const
   return armor_xyza_from_state(ekf_.x, false);
 }
 
+std::optional<Target::RigidArmorPrediction> Target::predict_rigid_armor(
+  int face, std::chrono::steady_clock::time_point time) const
+{
+  if (armor_num_ != 4 || name == ArmorName::outpost || face < 0 || face >= 4 ||
+      ekf_.x.size() != 11 || !ekf_.x.allFinite()) return {};
+  const double dt = tools::delta_time(time, t_);
+  if (!std::isfinite(dt) || dt < 0.0) return {};
+  Eigen::VectorXd state = ekf_.x;
+  for (int i : {0, 2, 4, 6}) state[i] += dt * state[i + 1];
+  if (!state.allFinite()) return {};
+  state[6] = tools::limit_rad(std::remainder(state[6], 2.0 * CV_PI));
+  const auto xyz = h_armor_xyz(state, face);
+  const double angle = tools::limit_rad(state[6] + face * 2.0 * CV_PI / armor_num_);
+  RigidArmorPrediction out{{state[0], state[2]}, {xyz[0], xyz[1], xyz[2], angle}};
+  return out.center.allFinite() && out.xyza.allFinite()
+    ? std::optional<RigidArmorPrediction>(out) : std::nullopt;
+}
+
 std::vector<Eigen::Vector4d> Target::armor_xyza_from_state(
   const Eigen::VectorXd & state, bool prefer_direct_motion) const
 {

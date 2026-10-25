@@ -42,6 +42,7 @@
 #include "tasks/auto_aim/tracker.hpp"
 #include "tasks/auto_aim/yolo.hpp"
 #include "tasks/auto_aim/work_zone_target.hpp"
+#include "tasks/auto_aim/target_death_return.hpp"
 #include "tools/exiter.hpp"
 #include "tools/img_tools.hpp"
 #include "tools/logger.hpp"
@@ -233,6 +234,9 @@ int main(int argc, char * argv[])
   const bool xuc_high_speed_latest_frame_enabled =
     integration_yaml["xuc_high_speed_latest_frame_enabled"] &&
     integration_yaml["xuc_high_speed_latest_frame_enabled"].as<bool>();
+  const bool xuc_high_speed_packet_receive_enabled =
+    integration_yaml["xuc_high_speed_packet_receive_enabled"] &&
+    integration_yaml["xuc_high_speed_packet_receive_enabled"].as<bool>();
   const auto xuc_imu_alignment =
     std::chrono::duration_cast<std::chrono::steady_clock::duration>(
       std::chrono::duration<double, std::milli>(xuc_imu_alignment_ms));
@@ -933,6 +937,16 @@ int main(int argc, char * argv[])
       work_zone_config.loss_hold_s > 0.200)
     throw std::invalid_argument("XUC target confirmation must be 2-3 frames and loss 100-200ms");
   auto_aim::WorkZoneTarget work_zone_target(work_zone_config);
+  auto_aim::TargetDeathReturn::Config target_death_config;
+  target_death_config.enabled = integration_yaml["xuc_target_death_return_enabled"] &&
+    integration_yaml["xuc_target_death_return_enabled"].as<bool>();
+  if (integration_yaml["xuc_target_death_missing_ms"])
+    target_death_config.missing_s =
+      integration_yaml["xuc_target_death_missing_ms"].as<double>() / 1000.0;
+  auto_aim::TargetDeathReturn target_death_return(target_death_config);
+  tools::logger()->info(
+    "[XUC][RETURN] target-death enabled={} missing_ms={:.0f}; requires mode=1 and confirmed lit target",
+    target_death_config.enabled, target_death_config.missing_s * 1000.0);
   uint64_t work_zone_track_epoch = 0;
   auto_aim::FacePredictionResidual::Config face_residual_config;
   face_residual_config.enabled = integration_yaml["xuc_high_speed_face_residual_enabled"] &&
@@ -957,8 +971,9 @@ int main(int argc, char * argv[])
   std::unique_ptr<auto_aim::Tracker> legacy_tracker;
   if (xuc.enabled() && restore_legacy_stationary_low_speed)
     legacy_tracker = std::make_unique<auto_aim::Tracker>(config_path, solver, true);
+  const bool detector_uses_roi = integration_yaml["use_roi"].as<bool>();
   const bool roi_reacquisition_enabled =
-    integration_yaml["use_roi"].as<bool>() &&
+    detector_uses_roi &&
     integration_yaml["yolo_name"].as<std::string>() == "yolo26";
   const cv::Rect configured_detection_roi(
     integration_yaml["roi"]["x"].as<int>(), integration_yaml["roi"]["y"].as<int>(),
@@ -1028,6 +1043,10 @@ int main(int argc, char * argv[])
       rotation_model_config.high_speed_phase_enabled, xuc_gyro_predicted_fire_enabled,
       xuc_low_speed_predicted_yaw_tolerance_rad * 180.0 / M_PI,
       xuc_high_speed_predicted_yaw_tolerance_rad * 180.0 / M_PI);
+    tools::logger()->info(
+      "[XUC][RX_TIMING] high_speed_packet_receive={} high_max_read_bytes={} "
+      "non_high_read_bytes=64 timeout_ms=10 timestamp_basis=host_parse",
+      xuc_high_speed_packet_receive_enabled, sizeof(io::XucTxPacket));
     tools::logger()->info(
       "[XUC][POLICY] high_pitch_gate={} residual_deg={:.2f} tracking_deg={:.2f} "
       "variation_deg={:.2f} stable_ms={:.0f} prediction_quality={} max_past_error_deg={:.2f} "
@@ -1104,6 +1123,7 @@ int main(int argc, char * argv[])
   std::chrono::steady_clock::time_point direct_pitch_last_measurement;
   bool xuc_fire_candidate_active = false;
   RotationFireWindow rotation_fire_window;
+  int high_speed_delay_rotation_sign = 0;
   bool xuc_fire_ready_logged = false;
   int xuc_fire_candidate_frames = 0;
   std::chrono::steady_clock::time_point xuc_fire_candidate_since;
@@ -1184,6 +1204,11 @@ int main(int argc, char * argv[])
       first_loop = false;
     }
 
+    // Like camera selection, reception uses the preceding classification.
+    // Keep stationary/low-speed reads on the original 64-byte/10 ms policy.
+    const bool xuc_packet_boundary_receive_requested = xuc.enabled() &&
+      xuc_high_speed_packet_receive_enabled && high_speed_camera_mode;
+    xuc.set_high_speed_receive(xuc_packet_boundary_receive_requested);
     // Classification uses this frame's tracker result, so it can only select
     // the NEXT read. No future rate, raw SDK ID or IMU count predicts the mode.
     const bool camera_latest_requested = xuc.enabled() &&
@@ -1368,6 +1393,14 @@ int main(int argc, char * argv[])
     const bool full_frame_search_used = roi_reacquisition_enabled &&
       (full_frame_search || (xuc.enabled() && work_zone_target.needs_full_frame()));
     auto armors = detector.detect(img, camera_frame_count, full_frame_search_used);
+    // Snapshot live detections before Tracker filters/associations modify them.
+    // A failed pose/aim solution is not the disappearance of an illuminated target.
+    const bool target_death_visible = std::any_of(
+      armors.begin(), armors.end(), [&](const auto & armor) {
+        return armor.color == diagnostic_enemy_color;
+      });
+    const bool target_death_frame_valid = !img.empty();
+    const bool target_death_full_frame = !detector_uses_roi || full_frame_search_used;
     const auto detection_diagnostics = infantry_diagnostics_enabled
       ? detector.diagnostics() : auto_aim::YoloDetectionDiagnostics{};
     const std::size_t armors_before_color = armors.size();
@@ -1898,6 +1931,8 @@ int main(int argc, char * argv[])
       std::isfinite(fixed_center_yaw_rad);
     fixed_center_residual_input.face = fixed_center_prediction.face_id;
     fixed_center_residual_input.prediction_ns = fixed_center_prediction.prediction_ns;
+    fixed_center_residual_input.delay_s = fixed_center_prediction.delay_s;
+    fixed_center_residual_input.speed_mps = fixed_center_prediction.speed_mps;
     fixed_center_residual_input.raw_yaw_rad = fixed_center_prediction.valid
       ? std::atan2(fixed_center_xyza[1], fixed_center_xyza[0]) : NAN;
     if (fixed_center_shadow.ready) {
@@ -1955,6 +1990,20 @@ int main(int argc, char * argv[])
         gyro_center_yaw = fixed_center_follow_yaw;
         xuc_gyro_center_memory_yaw = fixed_center_follow_yaw;
       }
+    }
+    // A changed high-speed direction cannot reuse the preceding direction's
+    // two-frame qualification. Residual monitors already reset on sign changes.
+    if (high_speed_mode && !gyro_model_fresh) {
+      const int direction = native_fire_prediction.high_speed_rotation_sign;
+      if (direction != high_speed_delay_rotation_sign) {
+        rotation_fire_window = RotationFireWindow{};
+        xuc_fire_candidate_active = false;
+        xuc_fire_ready_logged = false;
+        xuc_fire_candidate_frames = 0;
+      }
+      high_speed_delay_rotation_sign = direction;
+    } else {
+      high_speed_delay_rotation_sign = 0;
     }
     const Eigen::VectorXd fire_prediction_state =
       fixed_center_source.available ? fixed_center_shadow.state :
@@ -2354,7 +2403,17 @@ int main(int argc, char * argv[])
         direct_pitch_measurement_fresh && command.control,
       command.yaw, command.pitch,
       targets.empty() ? uint64_t{0} : work_zone_track_epoch});
-    command.inhibit_shoot = xuc.enabled() && work_zone_output.inhibit_fire;
+    const bool target_death_was_armed = target_death_return.armed();
+    const auto target_death_output = target_death_return.update({
+      std::chrono::duration<double>(work_zone_now.time_since_epoch()).count(),
+      std::chrono::duration<double>(t.time_since_epoch()).count(),
+      xuc.work_zone_ready(), xuc.enabled() && xuc.rx_valid(),
+      target_death_frame_valid, target_death_full_frame, target_death_visible,
+      work_zone_output.state == auto_aim::WorkZoneTarget::State::tracking});
+    if (!target_death_was_armed && target_death_output.armed)
+      tools::logger()->info("[XUC][RETURN] armed after confirmed lit target in mode=1");
+    command.inhibit_shoot = xuc.enabled() &&
+      (work_zone_output.inhibit_fire || target_death_output.request_return);
     const bool native_shoot = !command.inhibit_shoot && shooter.shoot(command, aimer, targets, ypr);
     fire_gate_snapshot_valid = false;
     fire_first_blocker = -1;
@@ -2877,7 +2936,8 @@ int main(int argc, char * argv[])
         "[HIGH_QUALITY] pitch_open={} residual_deg={:+.3f} tracking_deg={:+.3f} "
         "variation_deg={:.3f} stable_ms={:.0f} prediction_open={} quality_ready={} "
         "prediction_current={} prediction_held={} "
-        "cycles={} past_error_deg={:.3f} fixed_center_shadow_ready={} shadow_us={:.0f}",
+        "cycles={} past_error_deg={:.3f} fixed_center_shadow_ready={} shadow_us={:.0f} "
+        "delay_direction={} delay_ms={:.1f}",
         high_speed_pitch_quality.open, direct_pitch_pixel_error_rad * RAD2DEG,
         high_speed_pitch_tracking_error_rad * RAD2DEG,
         high_speed_pitch_quality.variation_rad * RAD2DEG,
@@ -2885,7 +2945,8 @@ int main(int argc, char * argv[])
         face_residual.quality_ready, face_residual.eligible,
         face_residual.quality_retained, face_residual.quality_cycles,
         face_residual.past_error_bound_rad * RAD2DEG, fixed_center_shadow.ready,
-        fixed_center_compute_us);
+        fixed_center_compute_us, native_fire_prediction.high_speed_rotation_sign,
+        native_fire_prediction.delay_s * 1000.0);
     }
     if (infantry_diagnostics_enabled && fire_gate_snapshot_valid) {
       const auto gate_now = std::chrono::steady_clock::now();
@@ -3014,7 +3075,19 @@ int main(int argc, char * argv[])
       } else if (command.control) {
         work_zone_target.remember_final_command(command.yaw, command.pitch);
       }
+      // Trigger once; XucSender persists control=2 on following packets/heartbeats.
+      command.request_return = target_death_output.triggered;
+      if (target_death_output.request_return) {
+        command.control = false;
+        command.shoot = false;
+        command.inhibit_shoot = true;
+        command.target_valid_until_ns = 0;
+      }
     }
+    if (target_death_output.triggered)
+      tools::logger()->info(
+        "[XUC][RETURN] target lights-out inferred: full-frame missing_ms={:.0f} frames={}; control=2 shoot=0",
+        target_death_output.missing_s * 1000.0, target_death_output.missing_frames);
     if (xuc.enabled() && work_zone_output.inhibit_fire) {
       yaw_tracking_integral_raw_rad = 0.0;
       yaw_tracking_initialized = false;
@@ -3340,6 +3413,8 @@ int main(int argc, char * argv[])
               {"event_speed_mps", xuc_projectile_speed_mps},
               {"direct_pitch_and_event_speed_source", "xuc_projectile_speed_mps"},
               {"aimer_high_speed_delay_config_s", integration_yaml["high_speed_delay_time"].as<double>()},
+              {"aimer_high_speed_rotation_sign", debug.native.high_speed_rotation_sign},
+              {"aimer_selected_delay_s", number(debug.native.delay_s)},
               {"aimer_low_speed_delay_config_s", integration_yaml["low_speed_delay_time"].as<double>()},
               {"aimer_delay_adjustment_s", nullptr},
               {"range_raw_m", number(raw_pnp_range_m)},
@@ -3508,6 +3583,7 @@ int main(int argc, char * argv[])
           {"frame_ns", duration_cast<nanoseconds>(t.time_since_epoch()).count()},
           {"timestamp_basis", "host_steady_clock"},
           {"image_timestamp_basis", "host_receive_with_configured_offset"},
+          {"xuc_packet_boundary_receive_requested", xuc_packet_boundary_receive_requested},
           {"camera_latest_requested", camera_latest_requested},
           {"camera_latest_supported", camera_frame_info.latest_supported},
           {"camera_latest_selected", camera_frame_info.latest_selected},
@@ -3539,6 +3615,9 @@ int main(int argc, char * argv[])
           {"native_prediction_trusted", native_prediction_trusted && native.valid},
           {"work_zone_target_state", auto_aim::WorkZoneTarget::name(work_zone_output.state)},
           {"work_zone_inhibit_fire", work_zone_output.inhibit_fire},
+          {"target_death_return_armed", target_death_output.armed},
+          {"target_death_missing_ms", target_death_output.missing_s * 1000.0},
+          {"target_death_return_requested", target_death_output.request_return},
           {"native_geometry_source", native.whole_ekf_geometry
             ? "whole_ekf_rigid" : "existing"},
           {"native_prediction_ns", native.valid
@@ -3552,6 +3631,7 @@ int main(int argc, char * argv[])
           {"native_flight_time_used_s", number(native.flight_time_used_s)},
           {"native_flight_time_s", number(native.flight_time_s)},
           {"native_delay_s", number(native.delay_s)},
+          {"native_high_speed_rotation_sign", native.high_speed_rotation_sign},
           {"speed_mps", number(native.speed_mps)}, {"speed_source", debug.input_source},
           {"aimer_call_begin_ns", debug.aimer_begin_ns}, {"aimer_call_end_ns", debug.aimer_end_ns},
           {"omega_rad_s", number(gyro_omega_rad_s)},
@@ -3561,6 +3641,7 @@ int main(int argc, char * argv[])
           {"yaw_eskf_enabled", yaw_eskf_enabled},
           {"yaw_prediction_source", yaw_prediction_source},
           {"high_speed_batch_projection", tracker.frame_diagnostics().high_speed_batch_projection},
+          {"high_speed_pose_rejections", tracker.frame_diagnostics().high_speed_pose_rejections},
           {"yaw_model_trusted", yaw_motion_model_trusted},
           {"legacy_stationary_low_speed", legacy_tracker_active},
           {"rotation_mode_trusted", rotation_model.tracker_trusted},

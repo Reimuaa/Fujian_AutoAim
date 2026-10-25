@@ -4,6 +4,7 @@
 - 直接修改现有文件。禁止创建 final、copy、backup、日期或参数后缀的工程、源码、配置副本。
 - 只维护当前最终版；旧提交和旧标签已按用户要求清除，不恢复历史备份。以后只在现有目录修改，使用 Git status/diff 核对；按用户要求整理和提交本地改动，禁止自动创建归档分支、标签或副本。
 - 正式配置只有 `configs/standard.yaml`；标定工具配置只有 `configs/calibration.yaml`。运行 YAML 是启动器生成的缓存，不是第二份配置源。
+- 核对本机与小电脑代码是否一致时，忽略仿真/Windows 专用文件 `src/gestalt.cpp`、`io/gestalt/`、`configs/gestalt_sentry_outpost.yaml`、`thirdparty/easywsclient/`、`thirdparty/win_shims/`；同时忽略 `.gitattributes`、`assets/README.md`、`docs/artifacts.json`、`docs/dependencies.md`、`firmware/infantry/README.md` 的资源管理和说明差异，以及简洁/debug 模式开关、换行符和配置无意义空白差异。`librm` 是否初始化属于环境差异，不据此判定代码不一致，但仍核对两端固定的子模块提交。上述忽略仅用于两端一致性核对，不删除文件、不修改 Git 跟踪/上传规则，也不忽略共享自瞄源码、构建脚本或实机参数的实质差异。
 - 默认代码改进和调参只作用于高速模式；除非用户特别说明，静止、低速模式保持原有行为。修改共享链路时须核对模式隔离。
 - 默认工作范围到开火资格与指令发送；开火后的执行/离膛延迟及相关参数由用户调试。预测沿用用户当前参数和现有计算，未经用户明确要求不调整延迟、弹速或开发射后时延自适应。
 - 正式发布仓库为 `https://github.com/Reimuaa/Fujian_AutoAim.git`，正式开发线为该仓库的 `main`（本机远端名 `fujian`）。已有日期分支、旧标签和另一仓库历史保持原样，不自动混入旧代码或为每次提交新建分支。此开发机旧本地 `main` 属于另一仓库，不作为正式入口；当前工作分支应跟踪 `fujian/main`。

@@ -51,7 +51,7 @@ int main(int argc,char **argv) {
       Armor input(9,.95f,cv::Rect(0,0,100,40),points);
       input.type=ArmorType::small;input.name=ArmorName::three;
       auto legacy=input,batched=input;
-      solver.solve(legacy);solver.solve(batched,true);
+      assert(solver.solve(legacy));assert(solver.solve(batched,true));
       assert((legacy.xyz_in_world-batched.xyz_in_world).norm()==0.);
       assert((legacy.xyz_in_gimbal-batched.xyz_in_gimbal).norm()==0.);
       assert((legacy.ypr_in_gimbal-batched.ypr_in_gimbal).norm()==0.);
@@ -80,7 +80,7 @@ int main(int argc,char **argv) {
       const auto points=solver.reproject_armor({3.,0.,.08},.2,kind.first,kind.second);
       Armor legacy(9,.95f,cv::Rect(0,0,100,40),points);
       legacy.type=kind.first;legacy.name=kind.second;
-      auto batched=legacy;solver.solve(legacy);solver.solve(batched,true);
+      auto batched=legacy;assert(solver.solve(legacy));assert(solver.solve(batched,true));
       assert((legacy.xyz_in_world-batched.xyz_in_world).norm()==0.);
       assert((legacy.ypr_in_world-batched.ypr_in_world).norm()==0.);++excluded;
     }

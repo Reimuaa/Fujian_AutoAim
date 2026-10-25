@@ -489,7 +489,10 @@ Armor * Tracker::select_target(std::list<Armor> & armors)
   Armor * best = nullptr;
   double best_score = std::numeric_limits<double>::infinity();
   for (auto & armor : armors) {
-    solver_.solve(armor, high_speed_batch_projection_);
+    if (!solver_.solve(armor, high_speed_batch_projection_)) {
+      ++frame_diagnostics_.high_speed_pose_rejections;
+      continue;
+    }
     if (!armor.xyz_in_world.allFinite()) continue;
     const double center_score = std::hypot(armor.center_norm.x, armor.center_norm.y);
     const double range_score = armor.xyz_in_world.norm() / 10.0;
@@ -590,7 +593,10 @@ bool Tracker::update_target(std::list<Armor> & armors, std::chrono::steady_clock
         association_armor->type = target_.armor_type;
       }
 
-      solver_.solve(*association_armor, high_speed_batch_projection_);
+      if (!solver_.solve(*association_armor, high_speed_batch_projection_)) {
+        ++frame_diagnostics_.high_speed_pose_rejections;
+        continue;
+      }
       const double observed_range_m = std::max(0.05, association_armor->ypd_in_world[2]);
       const double detection_scale_px = std::max(
         30.0, std::sqrt(std::max(1.0, static_cast<double>(association_armor->box.area()))));

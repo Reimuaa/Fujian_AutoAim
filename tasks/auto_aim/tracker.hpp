@@ -46,6 +46,7 @@ public:
   struct FrameDiagnostics
   {
     bool high_speed_batch_projection = false;
+    int high_speed_pose_rejections = 0;  // Failed attempts, including identity fallbacks.
     bool target_state_available = false;
     bool initialized_this_frame = false;
     bool update_attempted = false;

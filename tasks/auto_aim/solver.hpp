@@ -31,7 +31,10 @@ public:
 
   void set_R_gimbal2world(const Eigen::Quaterniond & q);
 
-  void solve(Armor & armor, bool batch_projection = false) const;
+  // The explicit high-speed batch path rejects invalid poses and catches OpenCV
+  // failures. False means the observation must be discarded. The default path
+  // retains the original stationary/low-speed solving and exception behaviour.
+  bool solve(Armor & armor, bool batch_projection = false) const;
 
   std::vector<cv::Point2f> reproject_armor(
     const Eigen::Vector3d & xyz_in_world, double yaw, ArmorType type, ArmorName name) const;
@@ -51,6 +54,7 @@ private:
   Eigen::Vector3d t_camera2gimbal_;
   Eigen::Matrix3d R_gimbal2world_;
 
+  bool solve_pose(Armor & armor, bool batch_projection) const;
   void optimize_yaw(Armor & armor) const;
   void optimize_yaw_batched(Armor & armor) const;
 

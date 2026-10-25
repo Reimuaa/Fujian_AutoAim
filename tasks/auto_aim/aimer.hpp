@@ -26,6 +26,7 @@ struct AimPoint
 enum class AimGeometry { existing, whole_ekf };
 // Explicit timing in standard; automatic preserves other callers' legacy API.
 enum class AimTiming { automatic, stationary, low_speed, high_speed };
+inline constexpr double high_speed_flight_tolerance_s = 0.00001;
 
 // Optional observer of the existing iterations. Never used for control.
 struct AimPredictionTrace
@@ -34,6 +35,8 @@ struct AimPredictionTrace
   bool whole_ekf_geometry = false;
   bool final_point_selection = false;
   int face_id = -1, iterations = 0;
+  // Explicit high-speed delay selection: +1 CCW, -1 CW, 0 fallback/non-high.
+  int high_speed_rotation_sign = 0;
   int64_t base_prediction_ns = 0, prediction_ns = 0;
   double delay_s = std::numeric_limits<double>::quiet_NaN();
   double speed_mps = std::numeric_limits<double>::quiet_NaN();
@@ -92,6 +95,7 @@ private:
   double leaving_angle_;
   double lock_id_ = -1;
   double high_speed_delay_time_;
+  double high_speed_delay_time_cw_, high_speed_delay_time_ccw_;
   double low_speed_delay_time_;
   double stationary_delay_time_;
   std::array<double, 4> delay_adjustment_times_{};

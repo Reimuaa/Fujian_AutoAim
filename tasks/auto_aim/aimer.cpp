@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <stdexcept>
 #include <vector>
 
 #include "tools/logger.hpp"
@@ -21,6 +22,19 @@ Aimer::Aimer(const std::string & config_path)
   comming_angle_ = yaml["comming_angle"].as<double>() / 57.3;  // degree to rad
   leaving_angle_ = yaml["leaving_angle"].as<double>() / 57.3;  // degree to rad
   high_speed_delay_time_ = yaml["high_speed_delay_time"].as<double>();
+  const auto directional_delay = [&](const char * key) {
+    if (!yaml[key]) return high_speed_delay_time_;
+    const auto value = yaml[key].as<double>();
+    if (!std::isfinite(value) || value < 0.0)
+      throw std::invalid_argument(std::string(key) + " must be finite and non-negative");
+    return value;
+  };
+  high_speed_delay_time_cw_ = directional_delay("high_speed_delay_time_cw");
+  high_speed_delay_time_ccw_ = directional_delay("high_speed_delay_time_ccw");
+  tools::logger()->info(
+    "[Aimer] high-speed delay cw={:.1f}ms ccw={:.1f}ms fallback={:.1f}ms (viewed from above)",
+    high_speed_delay_time_cw_ * 1000.0, high_speed_delay_time_ccw_ * 1000.0,
+    high_speed_delay_time_ * 1000.0);
   low_speed_delay_time_ = yaml["low_speed_delay_time"].as<double>();
   stationary_delay_time_ = yaml["stationary_delay_time"]
     ? yaml["stationary_delay_time"].as<double>() : low_speed_delay_time_;
@@ -96,7 +110,16 @@ io::Command Aimer::aim(
   switch (timing) {
     case AimTiming::stationary: delay_time = stationary_delay_time_; break;
     case AimTiming::low_speed: delay_time = low_speed_delay_time_; break;
-    case AimTiming::high_speed: delay_time = high_speed_delay_time_; break;
+    case AimTiming::high_speed: {
+      // Match the angular-rate source used by this prediction's geometry.
+      // Positive world yaw is CCW when viewed from above (+Z toward the origin).
+      const double omega = whole_ekf_geometry ? raw_state[7] : target.ekf_x()[7];
+      const int sign = std::isfinite(omega) ? (omega > 0.0 ? 1 : (omega < 0.0 ? -1 : 0)) : 0;
+      delay_time = sign > 0 ? high_speed_delay_time_ccw_
+        : (sign < 0 ? high_speed_delay_time_cw_ : high_speed_delay_time_);
+      if (trace) trace->high_speed_rotation_sign = sign;
+      break;
+    }
     default:
       delay_time = std::abs(target.ekf_x()[7]) > decision_speed_
         ? high_speed_delay_time_ : low_speed_delay_time_;
@@ -150,19 +173,17 @@ io::Command Aimer::aim(
       for (int iteration = 0; iteration < 10; ++iteration) {
         const auto prediction_time = future + std::chrono::microseconds(
           static_cast<int>(previous_flight * 1e6));
-        auto candidate = target;
-        candidate.predict(prediction_time);
-        const auto faces = candidate.whole_ekf_armor_xyza_list();
-        if (face >= faces.size() || !faces[face].allFinite()) break;
-        const auto & point = faces[face];
+        const auto candidate = target.predict_rigid_armor(static_cast<int>(face), prediction_time);
+        if (!candidate) break;
+        const auto & point = candidate->xyza;
         tools::Trajectory trajectory(bullet_speed, point.head<2>().norm(), point[2]);
         if (trajectory.unsolvable || !std::isfinite(trajectory.fly_time) ||
             trajectory.fly_time <= 0.0) break;
-        if (std::abs(trajectory.fly_time - previous_flight) < 0.001) {
-          const auto & state = candidate.ekf().x;
-          const double phase = tools::limit_rad(point[3] - std::atan2(state[2], state[0]));
+        if (std::abs(trajectory.fly_time - previous_flight) < high_speed_flight_tolerance_s) {
+          const double phase = tools::limit_rad(
+            point[3] - std::atan2(candidate->center[1], candidate->center[0]));
           const bool selectable = std::abs(phase) <= comming_angle_ &&
-            (state[7] > 0.0 ? phase < leaving_angle_ : phase > -leaving_angle_);
+            (target.ekf().x[7] > 0.0 ? phase < leaving_angle_ : phase > -leaving_angle_);
           const double yaw = std::atan2(point[1], point[0]) + yaw_offset_;
           const double pitch = -(trajectory.pitch + pitch_offset_);
           if (!selectable || !std::isfinite(yaw) || !std::isfinite(pitch)) break;
@@ -200,8 +221,10 @@ io::Command Aimer::aim(
     return {false, false, 0, 0};
   }
 
-  // 迭代求解飞行时间 (最多10次，收敛条件：相邻两次fly_time差 <0.001)
+  // Explicit high-speed rigid-body aiming uses 10us; legacy modes keep 1ms.
   bool converged = false;
+  const bool strict_high_speed = timing == AimTiming::high_speed && whole_ekf_geometry;
+  const double flight_tolerance_s = strict_high_speed ? high_speed_flight_tolerance_s : 0.001;
   double prev_fly_time = trajectory0.fly_time;
   tools::Trajectory current_traj = trajectory0;
   std::vector<Target> iteration_target(10, target);  // 创建10个目标副本用于迭代预测
@@ -240,11 +263,19 @@ io::Command Aimer::aim(
     }
 
     // 检查收敛条件
-    if (std::abs(current_traj.fly_time - prev_fly_time) < 0.001) {
+    if (std::abs(current_traj.fly_time - prev_fly_time) < flight_tolerance_s) {
       converged = true;
       break;
     }
     prev_fly_time = current_traj.fly_time;
+  }
+
+  // No high-speed command may use a solution that exhausted its iteration budget.
+  // Stationary/low-speed/automatic callers retain their historical behaviour.
+  if (strict_high_speed && !converged) {
+    debug_aim_point.valid = false;
+    if (trace) trace->flight_time_s = current_traj.fly_time;
+    return {false, false, 0, 0};
   }
 
   // 计算最终角度

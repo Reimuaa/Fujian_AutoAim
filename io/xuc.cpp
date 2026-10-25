@@ -634,7 +634,16 @@ void XucSender::recv_loop()
   while (!recv_quit_.load(std::memory_order_relaxed)) {
     size_t n = 0;
     try {
-      n = serial_.read(scratch, sizeof(scratch));
+      // The legacy 64-byte read waits for its 10 ms timeout even after a
+      // complete 30-byte feedback packet arrives, coalescing IMU timestamps.
+      // In high speed, stop at the next packet boundary instead. The parser
+      // below retains fewer than one packet, including after CRC resync, so
+      // a partial packet needs only its missing bytes. Idle/low speed keep
+      // the original read size and timeout. Kernel/USB batching remains
+      // observable; these timestamps are still host parse times, not IMU time.
+      const auto read_size = high_speed_receive_.load(std::memory_order_relaxed)
+        ? sizeof(XucTxPacket) - buf.size() : sizeof(scratch);
+      n = serial_.read(scratch, read_size);
     } catch (const std::exception &) {
       break;
     }

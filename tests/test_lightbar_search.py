@@ -506,6 +506,7 @@ int main() {
 #include <vector>
 #include "tasks/auto_aim/work_zone_target.hpp"
 #include "io/command.hpp"
+#include "tasks/auto_aim/target_death_return.hpp"
 struct Logger { template<class... T> void info(T...) {} };
 namespace tools { Logger * logger() {static Logger value;return &value;} }
 struct Xuc {
@@ -525,6 +526,8 @@ struct Tracker {
 struct Target {int name=1;};
 int main() {
   auto_aim::WorkZoneTarget work_zone_target;
+  auto_aim::TargetDeathReturn target_death_return; // Missing key preserves old behaviour.
+  const bool target_death_frame_valid=true,target_death_full_frame=true,target_death_visible=true;
   uint64_t work_zone_track_epoch=1;
   bool xuc_imu_sync_valid=true,direct_measurement_from_tracker=true;
   bool direct_yaw_measurement_fresh=true,direct_pitch_measurement_fresh=true;

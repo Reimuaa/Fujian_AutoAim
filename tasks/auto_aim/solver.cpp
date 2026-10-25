@@ -2,6 +2,8 @@
 
 #include <yaml-cpp/yaml.h>
 
+#include <algorithm>
+#include <cmath>
 #include <vector>
 
 #include "tools/logger.hpp"
@@ -64,15 +66,34 @@ void Solver::set_R_gimbal2world(const Eigen::Quaterniond & q)
 }
 
 //solvePnP（获得姿态）
-void Solver::solve(Armor & armor, bool batch_projection) const
+bool Solver::solve(Armor & armor, bool batch_projection) const
+{
+  if (!batch_projection) return solve_pose(armor, false);
+  // OpenCV's four-point input contract only; no new convexity/quality gate.
+  if (armor.points.size() != 4 ||
+      !std::all_of(armor.points.begin(), armor.points.end(), [](const cv::Point2f & p) {
+        return std::isfinite(p.x) && std::isfinite(p.y);
+      })) return false;
+  try {
+    return solve_pose(armor, true);
+  } catch (const cv::Exception &) {
+    return false;
+  }
+}
+
+bool Solver::solve_pose(Armor & armor, bool batch_projection) const
 {
   const auto & object_points =
     (armor.type == ArmorType::big) ? BIG_ARMOR_POINTS : SMALL_ARMOR_POINTS;
 
   cv::Vec3d rvec, tvec;
-  cv::solvePnP(
+  const bool solved = cv::solvePnP(
     object_points, armor.points, camera_matrix_, distort_coeffs_, rvec, tvec, false,
     cv::SOLVEPNP_IPPE);
+  if (batch_projection && (!solved ||
+      !std::all_of(rvec.val, rvec.val + 3, [](double v) { return std::isfinite(v); }) ||
+      !std::all_of(tvec.val, tvec.val + 3, [](double v) { return std::isfinite(v); })))
+    return false;
 
   Eigen::Vector3d xyz_in_camera;
   cv::cv2eigen(tvec, xyz_in_camera);
@@ -81,6 +102,13 @@ void Solver::solve(Armor & armor, bool batch_projection) const
 
   cv::Mat rmat;
   cv::Rodrigues(rvec, rmat);
+  if (batch_projection) {
+    for (const auto & point : object_points) {
+      const double depth = rmat.at<double>(2, 0) * point.x +
+        rmat.at<double>(2, 1) * point.y + rmat.at<double>(2, 2) * point.z + tvec[2];
+      if (!std::isfinite(depth) || depth <= 0.0) return false;
+    }
+  }
   Eigen::Matrix3d R_armor2camera;
   cv::cv2eigen(rmat, R_armor2camera);
   Eigen::Matrix3d R_armor2gimbal = R_camera2gimbal_ * R_armor2camera;
@@ -89,15 +117,20 @@ void Solver::solve(Armor & armor, bool batch_projection) const
   armor.ypr_in_world = tools::eulers(R_armor2world, 2, 1, 0);
 
   armor.ypd_in_world = tools::xyz2ypd(armor.xyz_in_world);
+  if (batch_projection && (!armor.xyz_in_gimbal.allFinite() ||
+      !armor.xyz_in_world.allFinite() || !armor.ypr_in_gimbal.allFinite() ||
+      !armor.ypr_in_world.allFinite() || !armor.ypd_in_world.allFinite())) return false;
 
   // 平衡不做yaw优化，因为pitch假设不成立
   auto is_balance = (armor.type == ArmorType::big) &&
                     (armor.name == ArmorName::three || armor.name == ArmorName::four ||
                      armor.name == ArmorName::five);
-  if (is_balance) return;
+  if (is_balance) return true;
 
   if (batch_projection) optimize_yaw_batched(armor);
   else optimize_yaw(armor);
+  return !batch_projection ||
+    (std::isfinite(armor.yaw_raw) && armor.ypr_in_world.allFinite());
 }
 
 std::vector<cv::Point2f> Solver::reproject_armor(

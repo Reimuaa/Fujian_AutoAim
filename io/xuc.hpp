@@ -131,6 +131,13 @@ public:
 
   // 下位机回传数据（接收线程更新；rx_valid() 为 false 时这些值不可信）
   bool rx_valid() const;
+  // Use the preceding vision classification, independently of shoot requests.
+  // An in-flight legacy read may finish before the next read changes policy.
+  // Do not change the shared serial timeout or invent sensor sample times.
+  void set_high_speed_receive(bool enabled)
+  {
+    high_speed_receive_.store(enabled, std::memory_order_relaxed);
+  }
   bool work_zone_ready() const { return enabled_ && rx_valid() && mode() == 1; }
   int64_t last_rx_ns() const
   {
@@ -300,6 +307,7 @@ private:
 
   std::thread recv_thread_;
   std::atomic<bool> recv_quit_{false};
+  std::atomic<bool> high_speed_receive_{false};
   std::atomic<bool> rx_valid_{false};
   std::atomic<int64_t> last_rx_ns_{0};
   std::atomic<uint64_t> successful_tx_count_{0};
