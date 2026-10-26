@@ -93,3 +93,9 @@ git clone --branch main --recurse-submodules https://github.com/Reimuaa/Fujian_A
 步兵与哨兵固件分别保存在 `firmware/infantry` 和 `firmware/sentry`，源码不代表车上已烧录版本，不能混刷。内外参和哨兵状态见[配置说明](docs/configuration.md)。
 
 模型与SDK继续使用机器现有路径，资源清单见[依赖说明](docs/dependencies.md)。10月11日用户认可的现场结果只作为历史参考，当前配置的实际出弹和命中效果仍须现场验证。完整状态见[当前状态](docs/status.md)。
+
+## 致谢
+
+特别感谢同济大学 **SuperPower 战队**开源的 [sp_vision_25](https://github.com/TongjiSuperPower/sp_vision_25) 项目。
+
+本项目在开发过程中参考并借鉴了该项目的设计与代码实现。感谢原作者、维护者及所有贡献者的开源付出，为本项目的学习、开发和改进提供了重要基础。
