@@ -70,7 +70,7 @@ yolo26_color_hold_frames: 20
 detector_debug: false
 # 排查时改为 true：记录帧/IMU、检测、跟踪、双轴指令及反馈，最多 3000 条摘要和 20 张丢失画面。
 # 正式运行保持 false，避免同步刷盘和图片编码影响下一帧。
-infantry_diagnostics_enabled: false
+infantry_diagnostics_enabled: true
 
 use_traditional: true
 # YOLO26 previously ignored use_traditional.  The adaptive two-light-bar
@@ -163,8 +163,8 @@ decision_speed: 0.8
 # Stationary stays 330 ms; low speed is now 320 ms.
 stationary_delay_time: 0.330
 high_speed_delay_time: 0.365
-high_speed_delay_time_cw: 0.385   # 顺时针高速：380 ms（俯视目标）
-high_speed_delay_time_ccw: 0.325   # 逆时针高速：325 ms（俯视目标）
+high_speed_delay_time_cw: 0.380   # 顺时针高速：380 ms（俯视目标）
+high_speed_delay_time_ccw: 0.425  # 逆时针高速：425 ms（俯视目标）
 low_speed_delay_time: 0.320
 
 actuation_delay_ms: 0

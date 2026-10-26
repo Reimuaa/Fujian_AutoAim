@@ -1,5 +1,11 @@
 # 配置与标定状态
 
+## 26.10.26_final 正式配置
+
+以小电脑最新回传的`configs/standard.yaml`为准：顺时针`high_speed_delay_time_cw: 0.380`（380ms），逆时针`high_speed_delay_time_ccw: 0.425`（425ms），`infantry_diagnostics_enabled: true`。相较`26.10.25final`仅这三项值改变；配置原文件已按SHA-256核对与小电脑完全一致。
+
+公共回退365ms、静止330ms、低速320ms、弹速23m/s、高速固定pitch补偿−1°及高速shoot=0释放1000ms保持。本次未修改算法、弹速或静止/低速配置。现场命中率反馈和静止/低速靶新问题见`docs/status.md`；以下为各版历史记录。
+
 ## 26.10.25final 正式配置
 
 本次最终版采用小电脑最后一次已完整核对的`configs/standard.yaml`原文，用户已确认小电脑代码未再修改：CW385ms、CCW325ms、公共365ms、静止330ms、低速320ms，额外高速pitch补偿−1°，弹速23m/s，高速shoot=0释放1000ms，IMU对齐+15ms，完整诊断关闭。配置行内旧注释中的380ms是历史说明，实际解析值为`high_speed_delay_time_cw: 0.385`。
