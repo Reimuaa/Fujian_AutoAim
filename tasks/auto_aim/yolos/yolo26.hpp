@@ -27,6 +27,7 @@ public:
   std::list<Armor> detect(const cv::Mat & bgr_img, int frame_count) override;
   std::list<Armor> detect(const cv::Mat & bgr_img, int frame_count, bool full_frame) override;
   YoloDetectionDiagnostics diagnostics() const override { return last_diagnostics_; }
+  void set_high_speed_color_gate(bool enabled) override { high_speed_color_gate_ = enabled; }
 
   std::list<Armor> postprocess(
     double scale, cv::Mat & output, const cv::Mat & bgr_img, int frame_count) override;
@@ -49,6 +50,8 @@ private:
   int color_min_pixels_per_bar_;
   int color_hold_frames_;
   bool require_lit_bars_ = false;
+  bool fixed_four_small_ = false;
+  bool high_speed_color_gate_ = false;
   LightbarColorGate lightbar_color_gate_;
   int letterbox_value_;
 
@@ -81,6 +84,7 @@ private:
 
   bool check_name(const Armor & armor) const;
   bool check_type(const Armor & armor) const;
+  void apply_target_identity(Armor & armor) const;
   bool has_plausible_geometry(const Armor & armor) const;
 
   cv::Point2f get_center_norm(const cv::Mat & bgr_img, const cv::Point2f & center) const;

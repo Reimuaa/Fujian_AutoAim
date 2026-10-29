@@ -351,6 +351,14 @@ int main(int argc,char ** argv) {
 
     def test_actual_rgb_gate_and_yolo_acceptance(self):
         source = (ROOT / "tasks/auto_aim/yolos/yolo26.cpp").read_text(encoding="utf-8")
+        standard = (ROOT / "src/standard.cpp").read_text(encoding="utf-8")
+        policy = standard.index("const bool high_speed_color_gate_used = high_speed_camera_mode;")
+        setter = standard.index("detector.set_high_speed_color_gate(high_speed_color_gate_used);")
+        detection = standard.index("auto armors = detector.detect(")
+        classification = standard.index("    auto rotation_model = rotation_model_manager.update(")
+        self.assertLess(policy, setter)
+        self.assertLess(setter, detection)
+        self.assertLess(detection, classification)
         check = source[source.index("bool YOLO26::check_name("):
                        source.index("bool YOLO26::has_plausible_geometry(")]
         refine = source[source.index("bool YOLO26::refine_color("):
@@ -374,6 +382,7 @@ struct Armor {
 class YOLO26 {
 public:
   bool require_lit_bars_=true, refine_color_=true, save_samples_=false;
+  bool high_speed_color_gate_=false;
   double min_confidence_=.1, color_confirmed_min_confidence_=.04;
   double memory_confirmed_min_confidence_=.06, color_confirmed_min_keypoint_confidence_=.75;
   int color_hold_frames_=20;
@@ -423,10 +432,40 @@ int main() {
   cv::line(saturated,{30,20},{30,70},{255,255,255},1);
   cv::line(saturated,{90,20},{90,70},{255,255,255},1);
   assert(detector.refine_color(armor,saturated,8));
+  // One color can have a wide saturation distribution (white core/blue edge).
+  // Keep the old decision when the high-speed policy is inactive, including
+  // after exiting high speed. Score/coverage/count must remain identical.
+  for(bool is_red : {false,true}) {
+    auto gradient=bars({80,20,220},{80,20,220});
+    cv::rectangle(gradient,{0,46},{119,99},{0,20,220},cv::FILLED);
+    if(is_red) cv::cvtColor(gradient,gradient,cv::COLOR_RGB2BGR);
+    const auto old_gate=detector.lightbar_color_gate_.evaluate(gradient,armor.points);
+    const auto fixed_gate=detector.lightbar_color_gate_.evaluate(gradient,armor.points,true);
+    assert(!old_gate.valid && fixed_gate.valid);
+    assert(fixed_gate.left.agreement==1. && fixed_gate.right.agreement==1.);
+    assert(old_gate.left.score==fixed_gate.left.score && old_gate.right.score==fixed_gate.right.score);
+    assert(old_gate.left.count==fixed_gate.left.count && old_gate.right.count==fixed_gate.right.count);
+    assert(old_gate.left.coverage==fixed_gate.left.coverage);
+    assert(!detector.refine_color(armor,gradient,10));
+    detector.high_speed_color_gate_=true;
+    assert(detector.refine_color(armor,gradient,11) && detector.check_name(armor));
+    assert(armor.color==(is_red ? Color::red : Color::blue));
+    detector.high_speed_color_gate_=false;
+    assert(!detector.refine_color(armor,gradient,12) && !detector.check_name(armor));
+  }
+  detector.high_speed_color_gate_=true;
+  // The corrected statistic still counts opposite-color pixels in its
+  // denominator, and it never supplies missing light or accepts white glare.
+  for(auto image : {mixed, reflection, bars(red,blue), bars(red,dark),
+      bars(dark,dark), bars({200,200,200},{200,200,200}),
+      bars({80,200,20},{80,200,20}), bars({200,195,20},{200,195,20})}) {
+    assert(!detector.refine_color(armor,image,13) && !detector.check_name(armor));
+  }
   armor.points[0].x=std::numeric_limits<float>::quiet_NaN();
   assert(!detector.refine_color(armor,bars(red,red),9) && !detector.check_name(armor));
   std::cout << "PASS RGB: red/blue, dark/high-confidence, single/conflicting/mixed bars, "
-    "green/yellow/white, reflections, saturated core, stale memory and invalid input\n";
+    "green/yellow/white, reflections, saturated core, same-color saturation spread, "
+    "high-speed entry/exit, stale memory and invalid input\n";
 }
 '''.replace("CHECK", check).replace("REFINE", refine)
         compile_run(code, "lightbar_color_test", libraries=("opencv_core", "opencv_imgproc"))
@@ -577,8 +616,14 @@ BLOCK
   assert(yaw_tracking_integral_raw_rad==0 && !yaw_tracking_initialized && !yaw_tracking_lower_armed);
   assert(final_yaw_command_initialized && !final_yaw_lower_armed && std::abs(final_yaw_command_filtered-.3)<1e-9);
   bool roi_reacquisition_enabled=true,full_frame_search=false;
+  struct Detector {
+    bool high=false;
+    void set_high_speed_color_gate(bool enabled) { high=enabled; }
+  } detector;
+  for(bool high_speed_camera_mode : {false,true,false}) {
 FULL_FRAME
-  assert(full_frame_search_used);
+    assert(full_frame_search_used && detector.high==high_speed_camera_mode);
+  }
   std::this_thread::sleep_for(std::chrono::milliseconds(160));update();
   assert(!command.control && !command.shoot);
   xuc.phase=false;update();assert(!command.control);

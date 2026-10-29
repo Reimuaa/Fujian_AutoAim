@@ -1392,6 +1392,10 @@ int main(int argc, char * argv[])
     // index; the implicit -1 previously kept stale color memories forever.
     const bool full_frame_search_used = roi_reacquisition_enabled &&
       (full_frame_search || (xuc.enabled() && work_zone_target.needs_full_frame()));
+    // Match the camera policy: only the preceding confirmed high-speed mode
+    // selects the corrected color statistic. Other modes keep the old gate.
+    const bool high_speed_color_gate_used = high_speed_camera_mode;
+    detector.set_high_speed_color_gate(high_speed_color_gate_used);
     auto armors = detector.detect(img, camera_frame_count, full_frame_search_used);
     // Snapshot live detections before Tracker filters/associations modify them.
     // A failed pose/aim solution is not the disappearance of an illuminated target.
@@ -3606,6 +3610,7 @@ int main(int argc, char * argv[])
           {"target_present", has_target}, {"target_name", name}, {"target_type", type},
           {"armor_count", count}, {"tracker_converged", tracker_converged},
           {"frame_imu_valid", xuc_imu_sync_valid},
+          {"high_speed_color_gate", high_speed_color_gate_used},
           {"frame_imu_query_ns", duration_cast<nanoseconds>(
             frame_imu_requested_time.time_since_epoch()).count()},
           {"frame_imu_pose_rad", {number(ypr[0]), number(ypr[1])}},
@@ -4146,6 +4151,7 @@ int main(int argc, char * argv[])
         trace["associations"] = tracker.last_associations().size();
         trace["primary_detection"] = tracker.primary_detection_index();
         trace["primary_face"] = tracker.primary_face_id();
+        trace["high_speed_color_gate"] = high_speed_color_gate_used;
         trace["tracker_converged"] = tracker_converged;
         trace["tracker_target_state_available"] =
           tracker_frame_diagnostics.target_state_available;

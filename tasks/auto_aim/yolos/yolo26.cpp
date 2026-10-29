@@ -169,6 +169,8 @@ YOLO26::YOLO26(const std::string & config_path, bool debug)
   color_min_pixels_per_bar_ = std::max(1, color_min_pixels_per_bar_);
   require_lit_bars_ = yaml["yolo26_require_lit_bars"]
     ? yaml["yolo26_require_lit_bars"].as<bool>() : false;
+  fixed_four_small_ = yaml["yolo26_fixed_four_small"]
+    ? yaml["yolo26_fixed_four_small"].as<bool>() : false;
   if (require_lit_bars_ && !refine_color_) {
     throw std::invalid_argument("yolo26_require_lit_bars requires yolo26_refine_color");
   }
@@ -288,6 +290,11 @@ YOLO26::YOLO26(const std::string & config_path, bool debug)
   infer_request_.set_input_tensor(input_tensor_);
 
   tools::logger()->info("[YOLO26] Initialization complete - SYNC mode optimized");
+  tools::logger()->info("[YOLO26][TARGET] fixed_four_small={} identity={} geometry={}",
+    fixed_four_small_, fixed_four_small_ ? "four" : "network",
+    fixed_four_small_ ? "small_135x56mm" : "network");
+  tools::logger()->info(
+    "[YOLO26][COLOR] high_speed_agreement=same_color_sign non_high_agreement=legacy");
   tools::logger()->info(
     "[YOLO26] Config: threads={}, streams=1, requests=1, letterbox={}, "
     "min_confidence={:.2f}, candidate_confidence={:.2f}, direct/memory_confirmed={:.2f}/{:.2f}, "
@@ -556,6 +563,7 @@ std::list<Armor> YOLO26::parse(
     armors.back().keypoint_confidence = keypoint_confidences[i];
     if (refine_corners_) refine_corners(armors.back(), tmp_img);
     if (refine_color_) refine_color(armors.back(), tmp_img, frame_count);
+    apply_target_identity(armors.back());
   }
 
   // 过滤
@@ -653,6 +661,17 @@ bool YOLO26::refine_corners(Armor & armor, const cv::Mat & image)
       refined->score);
   }
   return true;
+}
+
+void YOLO26::apply_target_identity(Armor & armor) const
+{
+  if (!fixed_four_small_ || armor.name == ArmorName::not_armor) return;
+  // This field setup contains only physical four/small plates. Normalize before
+  // filtering and either tracker can initialize, so a transient digit error
+  // cannot establish a big-plate PnP model. Keep raw class/color/corners intact;
+  // confidence and current-lightbar acceptance still run below.
+  armor.name = ArmorName::four;
+  armor.type = ArmorType::small;
 }
 
 bool YOLO26::check_name(const Armor & armor) const
@@ -808,7 +827,8 @@ bool YOLO26::refine_color(Armor & armor, const cv::Mat & rgb_img, int frame_coun
   armor.color_score = 0.0;
   if (require_lit_bars_) armor.color = Color::extinguish;
   if (rgb_img.empty() || rgb_img.type() != CV_8UC3 || armor.points.size() != 4) return false;
-  const auto observed = lightbar_color_gate_.evaluate(rgb_img, armor.points);
+  const auto observed = lightbar_color_gate_.evaluate(
+    rgb_img, armor.points, high_speed_color_gate_);
   const bool current_image_reliable = observed.valid;
   if (require_lit_bars_) {
     // Strict mode never borrows a previous illuminated frame or the network's

@@ -1,5 +1,6 @@
 """High-speed result/exception checks and rejection propagation; no devices or PLL."""
 import unittest
+from pathlib import Path
 
 from test_lightbar_search import compile_run
 
@@ -17,6 +18,79 @@ CALIBRATION = (
 
 
 class HighSpeedPnpValidationTests(unittest.TestCase):
+    def test_fixed_four_small_survives_wrong_digit_and_tracker_reacquisition(self):
+        source = (Path(__file__).resolve().parents[1] /
+                  "tasks/auto_aim/yolos/yolo26.cpp").read_text(encoding="utf-8")
+        begin = source.index("void YOLO26::apply_target_identity(")
+        identity = source[begin:source.index("bool YOLO26::check_name(", begin)]
+        # Both detect() and postprocess() use parse(): normalize before filtering
+        # and before either the legacy or high-speed tracker can see a candidate.
+        self.assertLess(source.index("apply_target_identity(armors.back());"), begin)
+        self.assertLess(source.index("apply_target_identity(armors.back());"),
+                        source.index("bool name_ok = check_name(*it);"))
+        compile_run(r'''
+#include "tasks/auto_aim/tracker.hpp"
+#include <cassert>
+#include <iostream>
+namespace auto_aim {
+class YOLO26 {
+public:
+  bool fixed_four_small_=false;
+  void apply_target_identity(Armor &) const;
+};
+IDENTITY
+}
+using namespace auto_aim;
+int main(int argc,char **argv) {
+  assert(argc==2); Solver solver(argv[1]); YOLO26 detector;
+  const auto points=solver.reproject_armor({3.,0.,.08},.2,ArmorType::small,ArmorName::four);
+  const auto candidate=[&](int cls) {
+    return Armor(cls,.95f,cv::boundingRect(points),points,YOLOVersion::YOLO26);
+  };
+  // Opt-out retains the original network identity, including one/big.
+  auto original=candidate(8); detector.apply_target_identity(original);
+  assert(original.name==ArmorName::one && original.type==ArmorType::big);
+  detector.fixed_four_small_=true;
+  auto invalid=candidate(16); detector.apply_target_identity(invalid);
+  assert(invalid.name==ArmorName::not_armor);
+  for(bool batch : {false,true}) {
+    Tracker tracker(argv[1],solver,false);
+    tracker.set_high_speed_batch_projection(batch);
+    auto stamp=std::chrono::steady_clock::now();
+    for(int round=0;round<2;++round) {
+      // Every raw digit (both colors), including large-plate labels, must use
+      // the same real small-plate geometry even on the first reacquired frame.
+      for(int cls=0;cls<16;++cls) {
+        auto a=candidate(cls); const auto color=a.color;
+        detector.apply_target_identity(a);
+        assert(a.class_id==cls && a.color==color && a.points==points && a.confidence>.94);
+        assert(a.name==ArmorName::four && a.type==ArmorType::small);
+        assert(solver.solve(a,batch));
+        assert((a.xyz_in_world-Eigen::Vector3d(3.,0.,.08)).norm()<.005);
+        // Tracker receives only the selected enemy color, as in standard.
+        a.color=Color::blue; std::list<Armor> inputs{a};
+        stamp+=std::chrono::milliseconds(20);
+        const auto targets=tracker.track(inputs,stamp);
+        assert(!targets.empty() && targets.front().name==ArmorName::four);
+        assert(targets.front().armor_type==ArmorType::small);
+      }
+      for(int i=0;i<17;++i) {
+        std::list<Armor> empty; stamp+=std::chrono::milliseconds(20);
+        tracker.track(empty,stamp);
+      }
+      assert(tracker.state()=="lost");
+    }
+  }
+  std::cout<<"PASS real Solver/Tracker: all 16 labels, small PnP geometry, "
+    "both projection paths, loss/reacquisition, raw diagnostics and opt-out\n";
+}
+'''.replace("IDENTITY", identity), "test_fixed_four_small_tracker",
+            sources=("tasks/auto_aim/solver.cpp", "tasks/auto_aim/tracker.cpp",
+                     "tasks/auto_aim/target.cpp", "tasks/auto_aim/armor.cpp",
+                     "tools/extended_kalman_filter.cpp", "tools/math_tools.cpp", "tools/logger.cpp"),
+            libraries=("opencv_core", "opencv_imgproc", "opencv_calib3d", "yaml-cpp", "spdlog", "fmt"),
+            fixtures={"pose.yaml": CALIBRATION}, arguments=("pose.yaml",))
+
     def test_solver_failure_results_depth_and_exception_boundary(self):
         compile_run(r'''
 #include "tasks/auto_aim/solver.hpp"

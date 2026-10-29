@@ -35,6 +35,7 @@ public:
     return detect(img, frame_count);
   }
   virtual YoloDetectionDiagnostics diagnostics() const { return {}; }
+  virtual void set_high_speed_color_gate(bool) {}
 
   virtual std::list<Armor> postprocess(
     double scale, cv::Mat & output, const cv::Mat & bgr_img, int frame_count) = 0;
@@ -47,6 +48,7 @@ public:
 
   std::list<Armor> detect(const cv::Mat & img, int frame_count = -1, bool full_frame = false);
   YoloDetectionDiagnostics diagnostics() const;
+  void set_high_speed_color_gate(bool enabled);
 
   std::list<Armor> postprocess(
     double scale, cv::Mat & output, const cv::Mat & bgr_img, int frame_count);

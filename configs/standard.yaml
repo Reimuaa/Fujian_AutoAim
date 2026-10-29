@@ -51,6 +51,8 @@ letterbox_value: 114
 yolo26_swap_rb: false
 yolo26_refine_color: true
 yolo26_require_lit_bars: true
+# 现场只有4号小装甲板：在Tracker初始化前固定身份与135x56mm尺寸，保留原始class_id诊断。
+yolo26_fixed_four_small: true
 # Low-confidence candidates are accepted only when color, keypoints and
 # quadrilateral geometry independently agree. Red and blue use symmetric gates.
 yolo26_candidate_confidence: 0.04
@@ -163,8 +165,8 @@ decision_speed: 0.8
 # Stationary stays 330 ms; low speed is now 320 ms.
 stationary_delay_time: 0.330
 high_speed_delay_time: 0.365
-high_speed_delay_time_cw: 0.380   # 顺时针高速：380 ms（俯视目标）
-high_speed_delay_time_ccw: 0.425  # 逆时针高速：425 ms（俯视目标）
+high_speed_delay_time_cw: 0.250   # 顺时针高速：250 ms（俯视目标）
+high_speed_delay_time_ccw: 0.300  # 逆时针高速：300 ms（俯视目标）
 low_speed_delay_time: 0.320
 
 actuation_delay_ms: 0
@@ -254,9 +256,9 @@ xuc_heartbeat_hz: 40.0             # 独立于相机；发送合法CRC包，正�
 xuc_target_confirm_frames: 3        # 连续有效观测，有限yaw/pitch，才允许control=1
 xuc_target_loss_ms: 150.0           # 短暂丢失保持上次有效角度且禁发；超时control=0恢复MCU扫描
 xuc_target_death_return_enabled: true # 到位mode=1且确认见过亮灯靶后，持续无检测请求返航
-xuc_target_death_missing_ms: 1500.0 # 连续新鲜全画面无目标确认；500-10000ms；单进程仅触发一次
+xuc_target_death_missing_ms: 2000.0 # 连续新鲜全画面无目标确认；500-10000ms；单进程仅触发一次
 xuc_shoot_low_ms: 50.0             # 静止/低速：保持原低电平释放50ms，无额外请求间隔
-xuc_high_speed_shoot_low_ms: 1000.0 # 仅高速：首个shoot=0包成功写出后保持释放至少1000ms；请求时锁存模式
+xuc_high_speed_shoot_low_ms: 500.0 # 仅高速：首个shoot=0包成功写出后保持释放至少500ms；请求时锁存模式
 # shoot=1只发送一个数据包，下一包恢复0；不再按100ms保持高电平。
 # control=0无有效目标/恢复MCU扫描，1有效目标接管，2显式请求REAL返程。
 xuc_fire_guard_enabled: true       # require fresh measured armor in both axes
@@ -316,14 +318,14 @@ xuc_gyro_require_event_lock_for_fire: true
 # Stationary pixel gates and the independent high-speed gate below are unchanged.
 xuc_gyro_predicted_yaw_tolerance_deg: 0.4
 # High-speed-only gate; the previous key remains the accepted low-speed gate.
-# 0.1 is the parser's lower clamp bound, so this is the tightest legal value.
-xuc_high_speed_predicted_yaw_tolerance_deg: 0.1
+# 0.1 is the parser's lower clamp bound; the field value below may be wider.
+xuc_high_speed_predicted_yaw_tolerance_deg: 0.15
 xuc_gyro_predicted_yaw_trim_deg: 0.0
 # Past-only same-face forecast residual; only in the selected high_speed mode.
 # Flat model: >=3 completed passages, 8s history, bounded +/-0.3deg; high speed only.
 xuc_high_speed_face_residual_enabled: true
 # Refine by nearby forecast phase after independent past-turn validation.
-# At most +/-0.3deg extra, +/-0.6deg total; the firing gate stays +/-0.2deg.
+# At most +/-0.3deg extra, +/-0.6deg total; the independent firing gate is above.
 # Falls back to the original per-face correction; adds no firing lock/wait.
 xuc_high_speed_face_phase_residual_enabled: true
 xuc_gyro_visibility_yaw_tolerance_deg: 8.0
@@ -360,7 +362,7 @@ xuc_ballistic_reference_camera_range_m: 0.91
 xuc_ballistic_reference_total_drop_m: 0.08639  # physical 10m/s reference; zero fixed boresight bias
 xuc_ballistic_max_compensation_deg: 20.0    # 低弹速远距离补偿上限；下位机另保留25°/28°双层保护
 xuc_ballistic_pitch_trim_deg: 0.0       # 取消固定俯仰微调，仅保留原有弹道补偿
-xuc_high_speed_ballistic_pitch_trim_deg: -1.0  # 仅高速叠加固定P补偿；静止/低速仍用共用0°
+xuc_high_speed_ballistic_pitch_trim_deg: -1.2  # 仅高速叠加固定P补偿；静止/低速仍用共用0°
 # Robust shared range for ballistic elevation and gyro time-of-flight.  The
 # rigid-body near-face range is authoritative; raw PnP depth contributes only a
 # bounded 5% correction so oblique plates cannot move the aim by metres.

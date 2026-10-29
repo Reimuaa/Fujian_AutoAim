@@ -139,6 +139,11 @@ std::list<Armor> YOLO::detect(const cv::Mat & img, int frame_count, bool full_fr
   return yolo_->detect(img, frame_count, full_frame);
 }
 
+void YOLO::set_high_speed_color_gate(bool enabled)
+{
+  yolo_->set_high_speed_color_gate(enabled);
+}
+
 YoloDetectionDiagnostics YOLO::diagnostics() const
 {
   return yolo_->diagnostics();

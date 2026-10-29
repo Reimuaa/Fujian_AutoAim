@@ -35,7 +35,9 @@ public:
 
   void set_config(const Config & config) { config_ = config; }
 
-  Result evaluate(const cv::Mat & rgb, const std::vector<cv::Point2f> & points) const
+  Result evaluate(
+    const cv::Mat & rgb, const std::vector<cv::Point2f> & points,
+    bool same_color_agreement = false) const
   {
     Result result;
     if (rgb.empty() || rgb.type() != CV_8UC3 || points.size() != 4) return result;
@@ -49,8 +51,8 @@ public:
     if (length < 1.0 || width < 1.0) return result;
     const int thickness = std::max(5, static_cast<int>(std::lround(
       std::min(0.12 * width, 0.45 * length))));
-    result.left = sample(rgb, points[0], points[3], thickness);
-    result.right = sample(rgb, points[1], points[2], thickness);
+    result.left = sample(rgb, points[0], points[3], thickness, same_color_agreement);
+    result.right = sample(rgb, points[1], points[2], thickness, same_color_agreement);
     const bool left = reliable(result.left, config_.min_delta);
     const bool right = reliable(result.right, config_.min_delta);
     if (left && right) {
@@ -78,7 +80,9 @@ private:
       bar.agreement >= config_.min_agreement && std::abs(bar.score) >= delta;
   }
 
-  Bar sample(const cv::Mat & rgb, cv::Point2f p0, cv::Point2f p1, int thickness) const
+  Bar sample(
+    const cv::Mat & rgb, cv::Point2f p0, cv::Point2f p1, int thickness,
+    bool same_color_agreement) const
   {
     Bar stats;
     cv::Rect roi = cv::boundingRect(std::vector<cv::Point2f>{p0, p1});
@@ -112,18 +116,22 @@ private:
     std::nth_element(samples.begin(), middle, samples.end());
     const double median = *middle;
     double sum = 0.0;
-    int agree = 0;
+    int agree = 0, same_color = 0;
     for (const double value : samples) {
+      const bool same_sign = (value > 0) == (median > 0);
+      if (same_sign) ++same_color;
       if (std::abs(value - median) > 22.0) continue;
       sum += value;
       ++stats.count;
-      if ((value > 0) == (median > 0)) ++agree;
+      if (same_sign) ++agree;
     }
     if (!stats.count) return stats;
     stats.score = sum / stats.count;
-    // Keep conflicting pixels in the denominator: median filtering must not
-    // turn a half-red/half-blue lightbar into a unanimous color vote.
-    stats.agreement = static_cast<double>(agree) / samples.size();
+    // Saturation spread within one color is not a red/blue conflict. High speed
+    // counts color signs before robust score trimming; every conflicting pixel
+    // remains in the denominator. Default callers retain the legacy statistic.
+    stats.agreement = static_cast<double>(same_color_agreement ? same_color : agree) /
+      samples.size();
     stats.coverage = static_cast<double>(stats.count) / mask_pixels;
     return stats;
   }
